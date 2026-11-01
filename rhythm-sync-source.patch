@@ -1,0 +1,449 @@
+diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
+--- a/app/src/game/RhythmScene.ts
++++ b/app/src/game/RhythmScene.ts
+@@ -14,6 +14,10 @@
+   texts: Phaser.GameObjects.Text[]
+   start: number
+ }
++
++type DebugField = 'time' | 'error' | 'offset'
++// Seconds; positive values compensate delayed input.
++const inputOffset = 0
+ 
+ export class RhythmScene extends Phaser.Scene {
+   private onEvent!: (event: GameEvent) => void
+@@ -48,6 +52,14 @@
+   private activePhrase = -1
+   private audioReady = false
+   private paused = false
++  private debugPanel: HTMLElement | null = null
++  private debugFields: Record<DebugField, HTMLSpanElement> | null = null
++  private debugNoteTop = 0
++  private lastRawErrorMs: number | null = null
++  private lastDebugStatus = '等待按键'
++  private sceneGeneration = 0
++  private disposed = false
++  private rhythmProbe: NonNullable<Window['__rhythmProbe']> | null = null
+   private readonly nativeKeyDown = (event: KeyboardEvent) => this.onNativeKey(event)
+ 
+   constructor() {
+@@ -55,6 +67,8 @@
+   }
+ 
+   init(data: { onEvent: (event: GameEvent) => void }) {
++    this.sceneGeneration += 1
++    this.disposed = false
+     this.onEvent = data.onEvent
+     this.notes = []
+     this.started = false
+@@ -71,6 +85,8 @@
+     this.activePhrase = -1
+     this.audioReady = false
+     this.paused = false
++    this.lastRawErrorMs = null
++    this.lastDebugStatus = '等待按键'
+   }
+ 
+   create() {
+@@ -82,15 +98,21 @@
+     this.createField()
+     this.createChart()
+     this.createHud()
++    this.createDebugPanel()
+     this.createInput()
+     this.scale.on(Phaser.Scale.Events.RESIZE, this.onResize, this)
+     this.events.once(Phaser.Scenes.Events.SHUTDOWN, this.shutdown, this)
++    this.events.once(Phaser.Scenes.Events.DESTROY, this.shutdown, this)
+     this.anthem.preload()
+-    window.__rhythmProbe = () => ({
++    this.rhythmProbe = () => ({
+       now: this.anthem.now(), startAt: this.startAt, duration: this.duration,
+       ready: this.audioReady, sourceDuration: this.anthem.bufferDuration(), notes: this.notes.length,
+       score: this.score, combo: this.combo, miss: this.miss,
++      songTime: this.audioReady ? this.songTime() : 0,
++      lastRawErrorMs: this.lastRawErrorMs,
++      inputOffset,
+     })
++    window.__rhythmProbe = this.rhythmProbe
+     window.__GAME_READY__ = true
+   }
+ 
+@@ -211,14 +233,113 @@
+     }).setDepth(5).setStroke('#07131c', 3).setShadow(0, 2, '#000000', 5)
+   }
+ 
++  private createDebugPanel() {
++    this.debugPanel?.remove()
++    const compact = this.scale.width < 900
++    const panel = document.createElement("aside")
++    panel.id = "rhythm-debug-panel"
++    panel.setAttribute("aria-label", "音游同步调试面板")
++    Object.assign(panel.style, {
++      position: "fixed",
++      zIndex: "15",
++      left: "max(12px, env(safe-area-inset-left, 0px))",
++      top: "calc(60px + env(safe-area-inset-top, 0px))",
++      width: "188px",
++      padding: "8px 10px",
++      boxSizing: "border-box",
++      border: "1px solid rgba(145, 225, 213, 0.35)",
++      borderRadius: "6px",
++      background: "rgba(8, 20, 27, 0.88)",
++      color: "#e1eee7",
++      font: "11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace",
++      fontVariantNumeric: "tabular-nums",
++      pointerEvents: "none",
++      userSelect: "none",
++    })
++    if (compact) {
++      Object.assign(panel.style, {
++        left: "max(8px, env(safe-area-inset-left, 0px))",
++        right: "max(8px, env(safe-area-inset-right, 0px))",
++        top: "calc(4px + env(safe-area-inset-top, 0px))",
++        width: "auto",
++        padding: "3px 6px",
++        display: "grid",
++        gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
++        gap: "8px",
++      })
++    } else {
++      const title = document.createElement("div")
++      title.textContent = "SYNC DEBUG"
++      Object.assign(title.style, { color: "#91e1d5", fontSize: "10px", marginBottom: "4px" })
++      panel.appendChild(title)
++    }
++    const fields = {} as Record<DebugField, HTMLSpanElement>
++    const metrics: Array<[DebugField, string, string]> = [
++      ["time", "歌曲时间", "基于 AudioContext.currentTime，已扣除开始时间和输出延迟"],
++      ["error", "原始按键误差", "未扣除 inputOffset；负数为早按，正数为晚按"],
++      ["offset", "inputOffset", "当前输入延迟补偿值，正值抵消输入偏晚"],
++    ]
++    for (const [key, label, hint] of metrics) {
++      const row = document.createElement("div")
++      row.title = hint
++      Object.assign(row.style, {
++        display: "flex",
++        justifyContent: "space-between",
++        gap: "4px",
++        minWidth: "0",
++        whiteSpace: "nowrap",
++      })
++      const name = document.createElement("span")
++      name.textContent = compact ? { time: "时间", error: "误差", offset: "偏移" }[key] : label
++      Object.assign(name.style, {
++        display: "inline",
++        color: "#9fb4b9",
++        fontSize: compact ? "9px" : "10px",
++        lineHeight: compact ? "14px" : "16px",
++      })
++      const value = document.createElement("span")
++      value.dataset.debugValue = key
++      Object.assign(value.style, {
++        display: "inline",
++        fontSize: compact ? "10px" : "12px",
++        lineHeight: compact ? "14px" : "16px",
++      })
++      row.append(name, value)
++      panel.appendChild(row)
++      fields[key] = value
++    }
++    document.body.appendChild(panel)
++    this.debugPanel = panel
++    this.debugFields = fields
++    // 小屏预留顶部信息区，音符仍按绝对歌曲时间计算位置。
++    this.debugNoteTop = compact ? panel.getBoundingClientRect().bottom + 16 : 0
++    this.updateDebugPanel()
++  }
++  private updateDebugPanel(time = this.audioReady ? this.songTime() : 0) {
++    if (!this.debugFields) return
++    const signedMs = (value: number) => {
++      const rounded = Number(value.toFixed(1))
++      return `${rounded > 0 ? "+" : ""}${rounded.toFixed(1)} ms`
++    }
++    const values = {
++      time: `${time.toFixed(3)} s`,
++      error: this.lastRawErrorMs === null ? this.lastDebugStatus : signedMs(this.lastRawErrorMs),
++      offset: signedMs(inputOffset * 1000),
++    }
++    for (const key of Object.keys(values) as DebugField[]) {
++      const value = values[key]
++      if (this.debugFields[key].textContent !== value) this.debugFields[key].textContent = value
++    }
++  }
++
+   private createInput() {
+     // Native listener: judgement latency must not wait for Phaser's per-frame key queue.
+     window.addEventListener('keydown', this.nativeKeyDown)
+   }
+ 
+   private onNativeKey(event: KeyboardEvent) {
+-    if ((event.target as Element | null)?.closest('dialog, input, select, button')) return
+-    if (event.repeat) return
++    const target = event.target as Element | null
++    if (event.repeat || (typeof target?.closest === 'function' && target.closest('dialog, input, select, textarea, [contenteditable]:not([contenteditable="false"])'))) return
+     if ((event.code === 'KeyP' || event.code === 'Escape') && this.started && !this.completed) {
+       this.setPaused(!this.paused)
+       return
+@@ -228,18 +349,22 @@
+   }
+ 
+   start() {
+-    if (this.started || this.completed) return
++    if (this.started || this.completed || this.disposed) return
++    const generation = this.sceneGeneration
+     this.started = true
+     this.audioReady = false
+     this.countdownText.setText('载入校歌…')
+     void this.anthem.start(this.beat).then((startAt) => {
++      if (this.disposed || generation !== this.sceneGeneration || startAt === null) return
+       this.startAt = startAt
+       this.audioReady = true
+       this.countdownText.setText('3')
+       // Paused while the audio was still loading: keep the clock frozen.
+       if (this.paused) this.anthem.suspend()
+     }).catch(() => {
++      if (this.disposed || generation !== this.sceneGeneration) return
+       this.started = false
++      this.audioReady = false
+       this.onEvent({ type: 'reset' })
+     })
+   }
+@@ -254,9 +379,14 @@
+     this.onEvent({ type: 'paused', paused: value })
+   }
+ 
++  private songTime(): number {
++    return this.anthem.now() - this.startAt - this.anthem.outputLatency()
++  }
++
+   hitLane(lane: number) {
+     if (!this.started || !this.audioReady || this.completed || this.paused) return
+-    const now = this.anthem.now() - this.startAt
++    const sampledSongTime = this.songTime()
++    const now = sampledSongTime - inputOffset
+     this.tweens.killTweensOf(this.laneGlow[lane])
+     this.laneGlow[lane].alpha = 0.32
+     this.tweens.add({ targets: this.laneGlow[lane], alpha: 0, duration: 170 })
+@@ -270,7 +400,14 @@
+         target = note
+       }
+     }
+-    if (!target) return
++    if (!target) {
++      this.lastRawErrorMs = null
++      this.lastDebugStatus = '无匹配音符'
++      this.updateDebugPanel(sampledSongTime)
++      return
++    }
++    this.lastRawErrorMs = (sampledSongTime - target.time) * 1000
++    this.updateDebugPanel(sampledSongTime)
+     target.hit = true
+     target.obj.setVisible(false)
+     this.judgedCount += 1
+@@ -305,28 +442,31 @@
+   }
+ 
+   update() {
++    const sampledSongTime = this.audioReady ? this.songTime() : 0
++    this.updateDebugPanel(sampledSongTime)
+     if (!this.started || !this.audioReady || this.completed || this.paused) return
+-    const now = this.anthem.now() - this.startAt
++    const now = sampledSongTime
++    const judgeTime = now - inputOffset
+     if (now < 0) {
+       this.countdownText.setText(String(Math.max(1, Math.ceil(-now))))
+       return
+     }
+     this.countdownText.setText('')
+     const speed = Math.min(680, this.scale.height * 0.92)
+-    const angle = now > 10 ? Math.sin(now * 0.32) * 0.035 : 0
+-    this.line.setRotation(angle)
++    // Keep the visible judgement line at the logical target height.
++    this.line.setRotation(0)
+     for (const note of this.notes) {
+       if (note.hit || note.missed) continue
+       const until = note.time - now
+-      if (until < 1.5 && until > -0.24) {
++      if (until < 1.5 && until > -0.24 && this.judgeY - until * speed >= this.debugNoteTop) {
+         note.obj.setVisible(true)
+         note.obj.y = this.judgeY - until * speed
+         note.obj.x = this.scale.width / 2 + (note.lane - 1.5) * this.laneWidth
+-        note.obj.rotation = angle
++        note.obj.rotation = 0
+       } else {
+         note.obj.setVisible(false)
+       }
+-      if (now > note.time + 0.135) {
++      if (judgeTime > note.time + 0.135) {
+         note.missed = true
+         note.obj.setVisible(false)
+         this.miss += 1
+@@ -341,7 +481,7 @@
+     this.progress.clear()
+     this.progress.fillStyle(0xf0cb74, 0.8)
+     this.progress.fillRect(0, 0, this.scale.width * Math.min(1, now / this.duration), 3)
+-    if (now >= this.duration) this.finish()
++    if (now >= this.duration && this.notes.every(note => note.hit || note.missed)) this.finish()
+   }
+ 
+   /** Karaoke line: the phrase appears dimmed ~1.2s early, each character lights up at the
+@@ -419,11 +559,25 @@
+     }
+   }
+ 
+-  private shutdown() {
++  shutdown() {
++    if (this.disposed) return
++    this.disposed = true
++    this.sceneGeneration += 1
++    this.started = false
++    this.audioReady = false
++    this.events?.off(Phaser.Scenes.Events.SHUTDOWN, this.shutdown, this)
++    this.events?.off(Phaser.Scenes.Events.DESTROY, this.shutdown, this)
++    this.debugPanel?.remove()
++    this.debugPanel = null
++    this.debugFields = null
++    this.debugNoteTop = 0
+     window.removeEventListener('keydown', this.nativeKeyDown)
+-    this.scale.off(Phaser.Scale.Events.RESIZE, this.onResize, this)
++    this.scale?.off(Phaser.Scale.Events.RESIZE, this.onResize, this)
+     this.anthem.stop()
+-    delete window.__rhythmProbe
+-    window.__GAME_READY__ = false
++    if (window.__rhythmProbe === this.rhythmProbe) {
++      delete window.__rhythmProbe
++      window.__GAME_READY__ = false
++    }
++    this.rhythmProbe = null
+   }
+ }
+diff --git a/app/src/game/anthem.ts b/app/src/game/anthem.ts
+--- a/app/src/game/anthem.ts
++++ b/app/src/game/anthem.ts
+@@ -39,6 +39,7 @@
+   private audioData: ArrayBuffer | null = null
+   private loading: Promise<ArrayBuffer> | null = null
+   private decodedDuration = 0
++  private playbackGeneration = 0
+ 
+   private readonly syncSettings = () => {
+     try { this.muted = localStorage.getItem('game.muted') === '1' } catch { /* retain */ }
+@@ -70,33 +71,42 @@
+     void this.load().catch(() => { /* start() retries the request after a user gesture */ })
+   }
+ 
+-  async start(beat = 0.5): Promise<number> {
+-    const data = await this.load()
++  async start(beat = 0.5): Promise<number | null> {
+     this.stop()
+-    window.addEventListener('game-preferences-change', this.syncSettings)
+-    window.addEventListener('game-mute-change', this.syncSettings)
+-    this.ctx = new AudioContext()
+-    await this.ctx.resume()
+-    this.master = this.ctx.createGain()
+-    this.master.gain.value = this.muted ? 0 : 0.72 * readPreferences().music
+-    this.master.connect(this.ctx.destination)
+-    this.effects = this.ctx.createGain()
+-    this.effects.connect(this.ctx.destination)
+-    this.syncSettings()
+-    const buffer = await this.ctx.decodeAudioData(data.slice(0))
+-    this.decodedDuration = buffer.duration
+-    this.source = this.ctx.createBufferSource()
+-    this.source.buffer = buffer
+-    this.source.connect(this.master)
+-    // The 3s lead-in snaps to the chart's beat grid so the count-in ticks land
+-    // exactly on the pulse the first notes will follow.
+-    const leadIn = Math.max(2, Math.round(3 / beat) * beat)
+-    this.startAt = this.ctx.currentTime + leadIn
+-    this.source.start(this.startAt)
+-    for (let at = this.startAt - beat, i = 0; at > this.ctx.currentTime + 0.05; at -= beat, i += 1) {
+-      this.metronome(at, i % 4 === 0)
++    const generation = this.playbackGeneration
++    const ctx = new AudioContext()
++    this.ctx = ctx
++    const isCurrent = () => generation === this.playbackGeneration && this.ctx === ctx
++    try {
++      // Unlock during the user gesture, then schedule after loading and decoding.
++      const [data] = await Promise.all([this.load(), ctx.resume()])
++      if (!isCurrent()) return null
++      window.addEventListener('game-preferences-change', this.syncSettings)
++      window.addEventListener('game-mute-change', this.syncSettings)
++      this.master = ctx.createGain()
++      this.master.connect(ctx.destination)
++      this.effects = ctx.createGain()
++      this.effects.connect(ctx.destination)
++      this.syncSettings()
++      const buffer = await ctx.decodeAudioData(data.slice(0))
++      if (!isCurrent()) return null
++      this.decodedDuration = buffer.duration
++      this.source = ctx.createBufferSource()
++      this.source.buffer = buffer
++      this.source.connect(this.master)
++      // The lead-in follows the chart beat grid and uses the raw audio clock.
++      const leadIn = Math.max(2, Math.round(3 / beat) * beat)
++      this.startAt = ctx.currentTime + leadIn
++      this.source.start(this.startAt)
++      for (let at = this.startAt - beat, i = 0; at > ctx.currentTime + 0.05; at -= beat, i += 1) {
++        this.metronome(at, i % 4 === 0)
++      }
++      return this.startAt
++    } catch (error) {
++      if (!isCurrent()) return null
++      this.stop()
++      throw error
+     }
+-    return this.startAt
+   }
+ 
+   private metronome(at: number, accent = false): void {
+@@ -131,6 +141,13 @@
+     return this.ctx?.currentTime ?? 0
+   }
+ 
++  outputLatency(): number {
++    if (!this.ctx) return 0
++    const validLatency = (seconds: unknown) => typeof seconds === 'number' && Number.isFinite(seconds) && seconds >= 0 ? seconds : 0
++    // These are distinct output stages; both are measured in seconds.
++    return validLatency(this.ctx.baseLatency) + validLatency(this.ctx.outputLatency)
++  }
++
+   /** Suspending the AudioContext freezes currentTime, which is the chart clock —
+    *  so notes, lyrics and judgement all freeze exactly where they were. */
+   suspend(): void {
+@@ -155,6 +172,7 @@
+   }
+ 
+   stop(): void {
++    this.playbackGeneration += 1
+     window.removeEventListener('game-preferences-change', this.syncSettings)
+     window.removeEventListener('game-mute-change', this.syncSettings)
+     try { this.source?.stop() } catch { /* source may not have started */ }
+@@ -164,6 +182,6 @@
+     this.ctx = null
+     this.master = null
+     this.effects = null
+-    if (ctx && ctx.state !== 'closed') void ctx.close()
++    if (ctx && ctx.state !== 'closed') void ctx.close().catch(() => {})
+   }
+ }
+diff --git a/app/src/game/boot.ts b/app/src/game/boot.ts
+--- a/app/src/game/boot.ts
++++ b/app/src/game/boot.ts
+@@ -18,7 +18,7 @@
+       obstacles?: Array<{ x: number; kind: string }>
+     }
+     __GAME_READY__?: boolean
+-    __rhythmProbe?: () => { now: number; startAt: number; duration: number; ready: boolean; sourceDuration: number; notes: number; score: number; combo: number; miss: number }
++    __rhythmProbe?: () => { now: number; startAt: number; duration: number; ready: boolean; sourceDuration: number; notes: number; score: number; combo: number; miss: number; songTime: number; lastRawErrorMs: number | null; inputOffset: number }
+   }
+ }
+ 
+@@ -123,6 +123,8 @@
+ }
+ 
+ export function stopGame(): void {
++  if (activeScene instanceof RhythmScene) activeScene.shutdown()
++  document.getElementById('rhythm-debug-panel')?.remove()
+   activeDpiCleanup?.()
+   activeDpiCleanup = null
+   if (activeGame) activeGame.destroy(true)
