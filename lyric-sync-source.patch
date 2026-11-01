@@ -172,7 +172,7 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
        resolution: 2, fontFamily: 'ui-monospace, monospace', fontSize: this.scale.width < 600 ? '26px' : '36px', color: '#f4df9e', align: 'center',
      }).setOrigin(0.5).setDepth(5)
 -    this.lyricText = this.add.text(this.scale.width / 2, this.judgeY - 90, '大不自多 · 海纳江河', {
-+    const lyricY = Math.min(this.scale.height - 45, this.judgeY + 88)
++    const lyricY = this.scale.height / 2
 +    this.lyricText = this.add.text(this.scale.width / 2, lyricY, '', {
        resolution: 2, fontFamily: 'Noto Serif SC, Songti SC, serif', fontSize: this.scale.width < 600 ? '18px' : '24px', color: '#f1e6cc',
 -    }).setOrigin(0.5).setDepth(5)
@@ -261,7 +261,7 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
        this.lyricLine.setVisible(true)
 -      this.lyricLine.alpha = 0
 -      this.tweens.add({ targets: this.lyricLine, alpha: 1, duration: 320 })
-+      this.lyricLine.alpha = 1
++      this.lyricLine.alpha = 0.8
      }
      const phrase = this.phrases[this.activePhrase]
      for (let i = 0; i < phrase.chars.length; i += 1) {

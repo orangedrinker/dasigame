@@ -1,0 +1,32 @@
+{
+  "status": "passed",
+  "checks": [
+    {
+      "viewport": {
+        "width": 1280,
+        "height": 720
+      },
+      "center": {
+        "x": 640,
+        "y": 360
+      },
+      "alpha": 0.8,
+      "errors": [],
+      "external": []
+    },
+    {
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "center": {
+        "x": 195,
+        "y": 422
+      },
+      "alpha": 0.8,
+      "errors": [],
+      "external": []
+    }
+  ],
+  "timingData": "lyrics, chart and introOffset unchanged"
+}
