@@ -1,7 +1,7 @@
 diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
 --- a/app/src/game/RhythmScene.ts
 +++ b/app/src/game/RhythmScene.ts
-@@ -14,6 +14,10 @@
+@@ -14,6 +14,12 @@
    texts: Phaser.GameObjects.Text[]
    start: number
  }
@@ -9,10 +9,12 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
 +type DebugField = 'time' | 'error' | 'offset'
 +// Seconds; positive values compensate delayed input.
 +const inputOffset = 0
++// Seconds from the audible song start; retain the lyrics' relative timing.
++const lyricStartTime = 28.4
  
  export class RhythmScene extends Phaser.Scene {
    private onEvent!: (event: GameEvent) => void
-@@ -48,6 +52,14 @@
+@@ -48,6 +54,14 @@
    private activePhrase = -1
    private audioReady = false
    private paused = false
@@ -27,7 +29,7 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
    private readonly nativeKeyDown = (event: KeyboardEvent) => this.onNativeKey(event)
  
    constructor() {
-@@ -55,6 +67,8 @@
+@@ -55,6 +69,8 @@
    }
  
    init(data: { onEvent: (event: GameEvent) => void }) {
@@ -36,7 +38,7 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
      this.onEvent = data.onEvent
      this.notes = []
      this.started = false
-@@ -71,6 +85,8 @@
+@@ -71,6 +87,8 @@
      this.activePhrase = -1
      this.audioReady = false
      this.paused = false
@@ -45,7 +47,7 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
    }
  
    create() {
-@@ -82,15 +98,21 @@
+@@ -82,15 +100,21 @@
      this.createField()
      this.createChart()
      this.createHud()
@@ -68,7 +70,7 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
      window.__GAME_READY__ = true
    }
  
-@@ -211,14 +233,113 @@
+@@ -211,14 +235,113 @@
      }).setDepth(5).setStroke('#07131c', 3).setShadow(0, 2, '#000000', 5)
    }
  
@@ -184,7 +186,7 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
      if ((event.code === 'KeyP' || event.code === 'Escape') && this.started && !this.completed) {
        this.setPaused(!this.paused)
        return
-@@ -228,18 +349,22 @@
+@@ -228,18 +351,22 @@
    }
  
    start() {
@@ -208,7 +210,7 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
        this.onEvent({ type: 'reset' })
      })
    }
-@@ -254,9 +379,14 @@
+@@ -254,9 +381,14 @@
      this.onEvent({ type: 'paused', paused: value })
    }
  
@@ -224,7 +226,7 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
      this.tweens.killTweensOf(this.laneGlow[lane])
      this.laneGlow[lane].alpha = 0.32
      this.tweens.add({ targets: this.laneGlow[lane], alpha: 0, duration: 170 })
-@@ -270,7 +400,14 @@
+@@ -270,7 +402,14 @@
          target = note
        }
      }
@@ -240,7 +242,7 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
      target.hit = true
      target.obj.setVisible(false)
      this.judgedCount += 1
-@@ -305,28 +442,31 @@
+@@ -305,28 +444,31 @@
    }
  
    update() {
@@ -278,16 +280,46 @@ diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
          note.missed = true
          note.obj.setVisible(false)
          this.miss += 1
-@@ -341,7 +481,7 @@
+@@ -341,15 +483,18 @@
      this.progress.clear()
      this.progress.fillStyle(0xf0cb74, 0.8)
      this.progress.fillRect(0, 0, this.scale.width * Math.min(1, now / this.duration), 3)
 -    if (now >= this.duration) this.finish()
+-  }
+-
+-  /** Karaoke line: the phrase appears dimmed ~1.2s early, each character lights up at the
+-   *  exact moment the choir sings it (per-character onsets from the recording analysis). */
 +    if (now >= this.duration && this.notes.every(note => note.hit || note.missed)) this.finish()
-   }
- 
-   /** Karaoke line: the phrase appears dimmed ~1.2s early, each character lights up at the
-@@ -419,11 +559,25 @@
++  }
++
++  /** Start the first lyric at lyricStartTime; subsequent phrases retain their relative
++   *  timing and 1.2s preview, with no subtitle changes before the requested start. */
+   private updateLyrics(now: number) {
++    const lyricTime = now - lyricStartTime + (this.phrases[0]?.start ?? 0)
+     let index = -1
+-    for (let i = 0; i < this.phrases.length; i += 1) {
+-      if (this.phrases[i].start <= now + 1.2) index = i
++    if (now >= lyricStartTime) {
++      for (let i = 0; i < this.phrases.length; i += 1) {
++        if (this.phrases[i].start <= lyricTime + 1.2) index = i
++      }
+     }
+     if (index < 0) {
+       this.lyricText.setVisible(true)
+@@ -382,10 +527,10 @@
+     for (let i = 0; i < phrase.chars.length; i += 1) {
+       const text = phrase.texts[i]
+       if (!text) continue
+-      const sung = phrase.chars[i].time <= now + 0.02
++      const sung = phrase.chars[i].time <= lyricTime + 0.02
+       const targetColor = sung ? '#ffe9ad' : '#8fa3a8'
+       if (text.style.color !== targetColor) text.setColor(targetColor)
+-      const isNow = sung && phrase.chars[i].time > now - this.beat * 0.5
++      const isNow = sung && phrase.chars[i].time > lyricTime - this.beat * 0.5
+       const targetScale = isNow ? 1.18 : 1
+       if (Math.abs(text.scale - targetScale) > 0.02) text.setScale(targetScale)
+     }
+@@ -419,11 +564,25 @@
      }
    }
  
