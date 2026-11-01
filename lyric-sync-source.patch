@@ -1,0 +1,1586 @@
+diff --git a/app/scripts/rebuild-aligned-chart.py b/app/scripts/rebuild-aligned-chart.py
+new file mode 100644
+--- /dev/null
++++ b/app/scripts/rebuild-aligned-chart.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""Build note attacks from confirmed per-character alignment, reusing visual style.
++
++The template supplies lane/pitch colors and the beat/count-in, not vocal timings.
++Every sung note uses an aligned character attack; phrase openings receive a
++two-lane chord. The original instrumental intro note remains at its file time.
++"""
++import argparse
++import copy
++import json
++from pathlib import Path
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--template', type=Path, required=True)
++    parser.add_argument('--phrases', type=Path, required=True)
++    parser.add_argument('--lyrics', type=Path, required=True)
++    parser.add_argument('--intro-offset', type=float, required=True)
++    parser.add_argument('--output', type=Path, required=True)
++    args = parser.parse_args()
++    template = json.loads(args.template.read_text())
++    phrases = json.loads(args.phrases.read_text())
++    confirmed = [line.strip() for line in args.lyrics.read_text().splitlines() if line.strip()]
++    if [p['text'] for p in phrases] != confirmed:
++        raise ValueError('Aligned phrases must exactly match the confirmed lyrics')
++    styles = [n for n in template['notes'] if not n['lyric'].startswith('前奏')]
++    chars = [(pi, ci, char) for pi, phrase in enumerate(phrases) for ci, char in enumerate(phrase['chars'])]
++    if len(chars) != sum(map(len, confirmed)):
++        raise ValueError('Alignment must include every confirmed character')
++    intro = copy.deepcopy(template['notes'][0])
++    if not intro['lyric'].startswith('前奏'):
++        raise ValueError('Template has no expected instrumental intro note')
++    intro['lyric'] = '前奏'
++    intro['vocal'] = False
++    intro['chord'] = False
++    intro['chordLane'] = None
++    notes = [intro]
++    lyrics = []
++    previous_time = -1
++    previous_lane = intro['lane']
++    for index, (phrase_index, char_index, entry) in enumerate(chars):
++        phrase = phrases[phrase_index]
++        if not phrase['start'] <= entry['start'] < entry['end'] <= phrase['end'] <= template['duration']:
++            raise ValueError(f'Character interval is outside phrase/recording: {entry}')
++        if entry['start'] <= previous_time:
++            raise ValueError(f'Character attacks must strictly increase: {entry}')
++        previous_time = entry['start']
++        style = styles[round(index * (len(styles) - 1) / max(1, len(chars) - 1))]
++        lane = style['lane']
++        if lane == previous_lane:
++            lane = (lane + 1) % 4
++        previous_lane = lane
++        chord = char_index == 0
++        notes.append({
++            'time': entry['start'],
++            'duration': round(min(.95, max(.1, (entry['end'] - entry['start']) * .82)), 4),
++            'pitch': style['pitch'],
++            'lyric': entry['char'],
++            'lane': lane,
++            'chord': chord,
++            'chordLane': (lane + 2) % 4 if chord else None,
++            'vocal': True,
++        })
++        lyrics.append({'time': entry['start'], 'char': entry['char'], 'phrase': phrase_index})
++    result = {
++        'duration': template['duration'],
++        'beat': template['beat'],
++        'source': '浙江大学文琴合唱团《浙江大学校歌》；完整确认歌词 + Demucs 人声强制对齐',
++        'vocalOrigin': args.intro_offset,
++        'notes': notes,
++        'lyrics': lyrics,
++    }
++    args.output.write_text(json.dumps(result, ensure_ascii=False, separators=(',', ':')) + '\n')
++    print(f'Built {len(chars)} aligned vocal attacks, {len(phrases)} phrase-opening chords, 1 preserved intro note')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/app/scripts/verify-logic.mjs b/app/scripts/verify-logic.mjs
+--- a/app/scripts/verify-logic.mjs
++++ b/app/scripts/verify-logic.mjs
+@@ -6,7 +6,7 @@
+ const directory=await mkdtemp(join(process.cwd(),'.logic-check-'))
+ try {
+  const file=join(directory,'tests.mjs')
+- await build({entryPoints:['tests/progression.test.ts'],outfile:file,bundle:true,platform:'node',format:'esm',define:{'import.meta.env.VITE_GAME_EDITION':'"formal"'}})
+- const result=spawnSync(process.execPath,['--test',file],{stdio:'inherit',timeout:30000})
++ await build({stdin:{contents:"import './tests/progression.test.ts'; import './tests/anthem-timing.test.ts'",resolveDir:process.cwd()},outfile:file,bundle:true,platform:'node',format:'esm',define:{'import.meta.env.VITE_GAME_EDITION':'"formal"'}})
++ const result=spawnSync(process.execPath,[file],{stdio:'inherit',timeout:30000})
+  process.exitCode=result.status??1
+ } finally { await rm(directory,{recursive:true,force:true}) }
+diff --git a/app/src/game/RhythmScene.ts b/app/src/game/RhythmScene.ts
+--- a/app/src/game/RhythmScene.ts
++++ b/app/src/game/RhythmScene.ts
+@@ -1,6 +1,7 @@
+ import Phaser from 'phaser'
+-import { AnthemPlayer, buildAnthem, type AnthemNote, type LyricChar } from './anthem'
++import { AnthemPlayer, buildAnthem, type AnthemNote } from './anthem'
+ import type { GameEvent } from './types'
++import { activePhraseIndex, introOffset, recordingTime, vocalTime } from './anthem-timing'
+ 
+ type ChartNote = AnthemNote & {
+   lane: number
+@@ -10,16 +11,16 @@
+ }
+ 
+ type LyricPhrase = {
+-  chars: LyricChar[]
++  chars: Array<{ char: string; start: number; end: number }>
+   texts: Phaser.GameObjects.Text[]
+   start: number
++  end: number
++  text: string
+ }
+ 
+ type DebugField = 'time' | 'error' | 'offset'
+ // Seconds; positive values compensate delayed input.
+ const inputOffset = 0
+-// Seconds from the audible song start; retain the lyrics' relative timing.
+-const lyricStartTime = 28.4
+ 
+ export class RhythmScene extends Phaser.Scene {
+   private onEvent!: (event: GameEvent) => void
+@@ -113,6 +114,18 @@
+       songTime: this.audioReady ? this.songTime() : 0,
+       lastRawErrorMs: this.lastRawErrorMs,
+       inputOffset,
++      introOffset,
++      fileTime: this.audioReady ? recordingTime(this.songTime()) : 0,
++      firstNoteTime: this.notes[0]?.time ?? 0,
++      firstSungNoteTime: this.notes.find((note) => note.vocal)?.time ?? 0,
++      noteTargets: this.notes.map((note) => ({ time: note.time, fileTime: recordingTime(note.time), lane: note.lane, lyric: note.lyric, vocal: Boolean(note.vocal) })),
++      firstLyricTime: (this.phrases[0]?.start ?? introOffset) - introOffset,
++      countdown: this.countdownText.text,
++      activePhrase: this.activePhrase,
++      lyricText: this.phrases[this.activePhrase]?.text ?? '',
++      lyricVisible: this.lyricLine.visible,
++      phraseStart: this.phrases[this.activePhrase]?.start ?? null,
++      phraseEnd: this.phrases[this.activePhrase]?.end ?? null,
+     })
+     window.__rhythmProbe = this.rhythmProbe
+     window.__GAME_READY__ = true
+@@ -175,15 +188,11 @@
+     const song = buildAnthem()
+     this.duration = song.duration
+     this.beat = song.beat
+-    const phraseMap = new Map<number, LyricChar[]>()
+-    for (const entry of song.lyrics) {
+-      const list = phraseMap.get(entry.phrase) ?? []
+-      list.push(entry)
+-      phraseMap.set(entry.phrase, list)
+-    }
+-    this.phrases = [...phraseMap.entries()]
+-      .sort((a, b) => a[0] - b[0])
+-      .map(([, chars]) => ({ chars: chars.sort((a, b) => a.time - b.time), texts: [], start: chars[0]?.time ?? 0 }))
++    this.phrases = song.phrases.map((phrase) => ({
++      ...phrase,
++      chars: phrase.chars ?? Array.from(phrase.text, (char) => ({ char, start: phrase.start, end: phrase.end })),
++      texts: [],
++    }))
+     const centerX = this.scale.width / 2
+     const chart: Array<{ note: AnthemNote; lane: number; chord: boolean }> = []
+     song.notes.forEach((note, index) => {
+@@ -219,10 +228,11 @@
+     this.comboText = this.add.text(this.scale.width / 2, this.scale.height * 0.22, '', {
+       resolution: 2, fontFamily: 'ui-monospace, monospace', fontSize: this.scale.width < 600 ? '26px' : '36px', color: '#f4df9e', align: 'center',
+     }).setOrigin(0.5).setDepth(5)
+-    this.lyricText = this.add.text(this.scale.width / 2, this.judgeY - 90, '大不自多 · 海纳江河', {
++    const lyricY = Math.min(this.scale.height - 45, this.judgeY + 88)
++    this.lyricText = this.add.text(this.scale.width / 2, lyricY, '', {
+       resolution: 2, fontFamily: 'Noto Serif SC, Songti SC, serif', fontSize: this.scale.width < 600 ? '18px' : '24px', color: '#f1e6cc',
+-    }).setOrigin(0.5).setDepth(5)
+-    this.lyricLine = this.add.container(this.scale.width / 2, this.judgeY - 90).setDepth(5)
++    }).setOrigin(0.5).setDepth(5).setVisible(false)
++    this.lyricLine = this.add.container(this.scale.width / 2, lyricY).setDepth(5).setVisible(false)
+     this.feedbackText = this.add.text(this.scale.width / 2, this.judgeY - 50, '', {
+       resolution: 2, fontFamily: 'ui-monospace, monospace', fontSize: '17px', color: '#91e1d5',
+     }).setOrigin(0.5).setDepth(5)
+@@ -277,7 +287,7 @@
+     }
+     const fields = {} as Record<DebugField, HTMLSpanElement>
+     const metrics: Array<[DebugField, string, string]> = [
+-      ["time", "歌曲时间", "基于 AudioContext.currentTime，已扣除开始时间和输出延迟"],
++      ["time", "起唱时间", "基于 AudioContext.currentTime，已扣除开始时间、输出延迟和前奏；0 秒为首字起唱"],
+       ["error", "原始按键误差", "未扣除 inputOffset；负数为早按，正数为晚按"],
+       ["offset", "inputOffset", "当前输入延迟补偿值，正值抵消输入偏晚"],
+     ]
+@@ -382,7 +392,7 @@
+   }
+ 
+   private songTime(): number {
+-    return this.anthem.now() - this.startAt - this.anthem.outputLatency()
++    return vocalTime(this.anthem.now(), this.startAt, this.anthem.outputLatency())
+   }
+ 
+   hitLane(lane: number) {
+@@ -448,9 +458,10 @@
+     this.updateDebugPanel(sampledSongTime)
+     if (!this.started || !this.audioReady || this.completed || this.paused) return
+     const now = sampledSongTime
++    const fileTime = recordingTime(now)
+     const judgeTime = now - inputOffset
+-    if (now < 0) {
+-      this.countdownText.setText(String(Math.max(1, Math.ceil(-now))))
++    if (fileTime < 0) {
++      this.countdownText.setText(String(Math.max(1, Math.ceil(-fileTime))))
+       return
+     }
+     this.countdownText.setText('')
+@@ -479,25 +490,19 @@
+         this.updateHud()
+       }
+     }
+-    this.updateLyrics(now)
++    this.updateLyrics(fileTime)
+     this.progress.clear()
+     this.progress.fillStyle(0xf0cb74, 0.8)
+-    this.progress.fillRect(0, 0, this.scale.width * Math.min(1, now / this.duration), 3)
++    this.progress.fillRect(0, 0, this.scale.width * Math.min(1, fileTime / recordingTime(this.duration)), 3)
+     if (now >= this.duration && this.notes.every(note => note.hit || note.missed)) this.finish()
+   }
+ 
+-  /** Start the first lyric at lyricStartTime; subsequent phrases retain their relative
+-   *  timing and 1.2s preview, with no subtitle changes before the requested start. */
+-  private updateLyrics(now: number) {
+-    const lyricTime = now - lyricStartTime + (this.phrases[0]?.start ?? 0)
+-    let index = -1
+-    if (now >= lyricStartTime) {
+-      for (let i = 0; i < this.phrases.length; i += 1) {
+-        if (this.phrases[i].start <= lyricTime + 1.2) index = i
+-      }
+-    }
++  /** Show only the phrase whose aligned interval contains the actual recording
++   * time. End times prevent stale lyrics during rests; future phrases stay hidden. */
++  private updateLyrics(fileTime: number) {
++    const index = activePhraseIndex(this.phrases, fileTime)
+     if (index < 0) {
+-      this.lyricText.setVisible(true)
++      this.lyricText.setVisible(false)
+       this.lyricLine.setVisible(false)
+       this.activePhrase = -1
+       return
+@@ -508,7 +513,7 @@
+       this.lyricLine.removeAll(true)
+       const phrase = this.phrases[index]
+       const small = this.scale.width < 600
+-      const fontSize = small ? 22 : 30
++      const fontSize = Math.min(small ? 22 : 30, (this.scale.width - 32) / Math.max(1, phrase.chars.length * 1.14))
+       const step = fontSize * 1.14
+       const offset = -((phrase.chars.length - 1) / 2) * step
+       phrase.texts = phrase.chars.map((entry, i) => {
+@@ -520,17 +525,16 @@
+         return text
+       })
+       this.lyricLine.setVisible(true)
+-      this.lyricLine.alpha = 0
+-      this.tweens.add({ targets: this.lyricLine, alpha: 1, duration: 320 })
++      this.lyricLine.alpha = 1
+     }
+     const phrase = this.phrases[this.activePhrase]
+     for (let i = 0; i < phrase.chars.length; i += 1) {
+       const text = phrase.texts[i]
+       if (!text) continue
+-      const sung = phrase.chars[i].time <= lyricTime + 0.02
++      const sung = phrase.chars[i].start <= fileTime
+       const targetColor = sung ? '#ffe9ad' : '#8fa3a8'
+       if (text.style.color !== targetColor) text.setColor(targetColor)
+-      const isNow = sung && phrase.chars[i].time > lyricTime - this.beat * 0.5
++      const isNow = sung && fileTime < phrase.chars[i].end
+       const targetScale = isNow ? 1.18 : 1
+       if (Math.abs(text.scale - targetScale) > 0.02) text.setScale(targetScale)
+     }
+diff --git a/app/src/game/anthem-chart.json b/app/src/game/anthem-chart.json
+--- a/app/src/game/anthem-chart.json
++++ b/app/src/game/anthem-chart.json
+@@ -1 +1 @@
+-{"duration":172.225306,"beat":0.476134,"source":"浙江大学文琴合唱团《浙江大学校歌》","notes":[{"time":9.021,"duration":0.95,"pitch":6,"lyric":"前奏 · 大不自多","lane":2,"chord":false,"chordLane":null},{"time":13.4444,"duration":0.1523,"pitch":6,"lyric":"大不自多","lane":1,"chord":false,"chordLane":null},{"time":13.6301,"duration":0.2285,"pitch":6,"lyric":"大不自多","lane":0,"chord":false,"chordLane":null},{"time":13.9088,"duration":0.6379,"pitch":6,"lyric":"大不自多","lane":2,"chord":true,"chordLane":3},{"time":14.6866,"duration":0.3142,"pitch":6,"lyric":"大不自多","lane":0,"chord":false,"chordLane":null},{"time":15.0698,"duration":0.3808,"pitch":5,"lyric":"大不自多","lane":1,"chord":false,"chordLane":null},{"time":15.5341,"duration":0.95,"pitch":6,"lyric":"大不自多","lane":2,"chord":false,"chordLane":null},{"time":17.1595,"duration":0.6188,"pitch":5,"lyric":"海纳江河","lane":2,"chord":false,"chordLane":null},{"time":17.9142,"duration":0.6855,"pitch":5,"lyric":"海纳江河","lane":1,"chord":true,"chordLane":3},{"time":18.7501,"duration":0.95,"pitch":6,"lyric":"海纳江河","lane":0,"chord":true,"chordLane":2},{"time":20.1549,"duration":0.95,"pitch":5,"lyric":"海纳江河","lane":3,"chord":false,"chordLane":null},{"time":21.432,"duration":0.95,"pitch":5,"lyric":"惟学无际","lane":2,"chord":false,"chordLane":null},{"time":22.7556,"duration":0.2285,"pitch":5,"lyric":"惟学无际","lane":1,"chord":false,"chordLane":null},{"time":23.0342,"duration":0.95,"pitch":6,"lyric":"惟学无际","lane":0,"chord":false,"chordLane":null},{"time":24.3693,"duration":0.457,"pitch":5,"lyric":"惟学无际","lane":3,"chord":false,"chordLane":null},{"time":24.9266,"duration":0.9139,"pitch":5,"lyric":"惟学无际","lane":2,"chord":false,"chordLane":null},{"time":26.0412,"duration":0.7045,"pitch":5,"lyric":"惟学无际","lane":1,"chord":false,"chordLane":null},{"time":26.9003,"duration":0.95,"pitch":6,"lyric":"际于天地","lane":0,"chord":true,"chordLane":3},{"time":28.9669,"duration":0.219,"pitch":6,"lyric":"际于天地","lane":0,"chord":true,"chordLane":2},{"time":29.2339,"duration":0.1809,"pitch":5,"lyric":"际于天地","lane":1,"chord":false,"chordLane":null},{"time":29.4545,"duration":0.4379,"pitch":6,"lyric":"际于天地","lane":3,"chord":false,"chordLane":null},{"time":29.9886,"duration":0.1428,"pitch":6,"lyric":"际于天地","lane":0,"chord":false,"chordLane":null},{"time":30.1627,"duration":0.3808,"pitch":5,"lyric":"形上谓道兮","lane":2,"chord":false,"chordLane":null},{"time":30.6271,"duration":0.2475,"pitch":6,"lyric":"形上谓道兮","lane":1,"chord":true,"chordLane":3},{"time":30.929,"duration":0.5522,"pitch":6,"lyric":"形上谓道兮","lane":0,"chord":true,"chordLane":2},{"time":31.6024,"duration":0.3522,"pitch":7,"lyric":"形上谓道兮","lane":1,"chord":false,"chordLane":null},{"time":32.0319,"duration":0.2094,"pitch":5,"lyric":"形上谓道兮","lane":0,"chord":true,"chordLane":3},{"time":32.2873,"duration":0.1714,"pitch":6,"lyric":"形上谓道兮","lane":2,"chord":false,"chordLane":null},{"time":32.4963,"duration":0.4284,"pitch":6,"lyric":"形上谓道兮","lane":1,"chord":false,"chordLane":null},{"time":33.0188,"duration":0.3522,"pitch":6,"lyric":"形上谓道兮","lane":0,"chord":true,"chordLane":3},{"time":33.4483,"duration":0.2856,"pitch":5,"lyric":"形上谓道兮","lane":1,"chord":true,"chordLane":2},{"time":33.7966,"duration":0.7426,"pitch":6,"lyric":"形上谓道兮","lane":3,"chord":false,"chordLane":null},{"time":34.7022,"duration":0.2475,"pitch":7,"lyric":"形下谓器","lane":0,"chord":true,"chordLane":2},{"time":35.0041,"duration":0.238,"pitch":5,"lyric":"形下谓器","lane":1,"chord":true,"chordLane":3},{"time":35.2943,"duration":0.219,"pitch":6,"lyric":"形下谓器","lane":0,"chord":false,"chordLane":null},{"time":35.5614,"duration":0.8663,"pitch":6,"lyric":"形下谓器","lane":2,"chord":true,"chordLane":3},{"time":36.6179,"duration":0.3142,"pitch":6,"lyric":"形下谓器","lane":0,"chord":true,"chordLane":2},{"time":37.001,"duration":0.1523,"pitch":6,"lyric":"形下谓器","lane":1,"chord":false,"chordLane":null},{"time":37.1868,"duration":0.1428,"pitch":6,"lyric":"形下谓器","lane":3,"chord":false,"chordLane":null},{"time":37.3609,"duration":0.2951,"pitch":6,"lyric":"形下谓器","lane":0,"chord":false,"chordLane":null},{"time":37.7208,"duration":0.6379,"pitch":6,"lyric":"形下谓器","lane":2,"chord":false,"chordLane":null},{"time":38.4987,"duration":0.1428,"pitch":6,"lyric":"形下谓器","lane":1,"chord":false,"chordLane":null},{"time":38.6728,"duration":0.1809,"pitch":6,"lyric":"形下谓器","lane":0,"chord":false,"chordLane":null},{"time":38.8934,"duration":0.1238,"pitch":6,"lyric":"形下谓器","lane":3,"chord":false,"chordLane":null},{"time":39.0444,"duration":0.4189,"pitch":7,"lyric":"形下谓器","lane":2,"chord":false,"chordLane":null},{"time":39.5552,"duration":0.3808,"pitch":7,"lyric":"礼主别异兮","lane":0,"chord":true,"chordLane":1},{"time":40.0196,"duration":0.1523,"pitch":6,"lyric":"礼主别异兮","lane":3,"chord":false,"chordLane":null},{"time":40.2054,"duration":0.1999,"pitch":6,"lyric":"礼主别异兮","lane":2,"chord":false,"chordLane":null},{"time":40.4492,"duration":0.6093,"pitch":6,"lyric":"礼主别异兮","lane":0,"chord":true,"chordLane":1},{"time":41.1922,"duration":0.3237,"pitch":6,"lyric":"礼主别异兮","lane":3,"chord":false,"chordLane":null},{"time":41.5869,"duration":0.2094,"pitch":6,"lyric":"礼主别异兮","lane":0,"chord":true,"chordLane":2},{"time":41.8424,"duration":0.238,"pitch":6,"lyric":"礼主别异兮","lane":1,"chord":true,"chordLane":3},{"time":42.1326,"duration":0.2094,"pitch":6,"lyric":"礼主别异兮","lane":2,"chord":false,"chordLane":null},{"time":42.388,"duration":0.3046,"pitch":6,"lyric":"礼主别异兮","lane":0,"chord":true,"chordLane":1},{"time":42.7595,"duration":0.3618,"pitch":7,"lyric":"礼主别异兮","lane":2,"chord":true,"chordLane":3},{"time":43.2007,"duration":0.1618,"pitch":6,"lyric":"礼主别异兮","lane":0,"chord":false,"chordLane":null},{"time":43.3981,"duration":0.2951,"pitch":6,"lyric":"礼主别异兮","lane":1,"chord":false,"chordLane":null},{"time":43.758,"duration":0.8949,"pitch":6,"lyric":"礼主别异兮","lane":2,"chord":true,"chordLane":3},{"time":44.8493,"duration":0.219,"pitch":5,"lyric":"乐主和同","lane":3,"chord":false,"chordLane":null},{"time":45.1164,"duration":0.4474,"pitch":6,"lyric":"乐主和同","lane":0,"chord":true,"chordLane":1},{"time":45.662,"duration":0.4189,"pitch":6,"lyric":"乐主和同","lane":2,"chord":true,"chordLane":3},{"time":46.1729,"duration":0.257,"pitch":6,"lyric":"乐主和同","lane":1,"chord":false,"chordLane":null},{"time":46.4863,"duration":0.95,"pitch":5,"lyric":"乐主和同","lane":0,"chord":true,"chordLane":3},{"time":48.1234,"duration":0.1238,"pitch":4,"lyric":"乐主和同","lane":1,"chord":false,"chordLane":null},{"time":48.2743,"duration":0.1618,"pitch":5,"lyric":"乐主和同","lane":0,"chord":false,"chordLane":null},{"time":48.4717,"duration":0.1904,"pitch":6,"lyric":"乐主和同","lane":2,"chord":false,"chordLane":null},{"time":48.7039,"duration":0.6664,"pitch":5,"lyric":"乐主和同","lane":1,"chord":true,"chordLane":3},{"time":49.5166,"duration":0.257,"pitch":7,"lyric":"知其不二兮","lane":0,"chord":false,"chordLane":null},{"time":49.83,"duration":0.1904,"pitch":6,"lyric":"知其不二兮","lane":1,"chord":true,"chordLane":2},{"time":50.0622,"duration":0.1999,"pitch":6,"lyric":"知其不二兮","lane":0,"chord":true,"chordLane":3},{"time":50.306,"duration":0.3332,"pitch":6,"lyric":"知其不二兮","lane":1,"chord":false,"chordLane":null},{"time":50.7124,"duration":0.1238,"pitch":6,"lyric":"知其不二兮","lane":2,"chord":false,"chordLane":null},{"time":50.8633,"duration":0.714,"pitch":6,"lyric":"知其不二兮","lane":0,"chord":false,"chordLane":null},{"time":51.7341,"duration":0.4284,"pitch":7,"lyric":"知其不二兮","lane":2,"chord":false,"chordLane":null},{"time":52.2565,"duration":0.2094,"pitch":6,"lyric":"知其不二兮","lane":0,"chord":true,"chordLane":1},{"time":52.5119,"duration":0.1904,"pitch":6,"lyric":"知其不二兮","lane":2,"chord":true,"chordLane":3},{"time":52.7441,"duration":0.4665,"pitch":6,"lyric":"知其不二兮","lane":0,"chord":false,"chordLane":null},{"time":53.313,"duration":0.1238,"pitch":6,"lyric":"知其不二兮","lane":1,"chord":false,"chordLane":null},{"time":53.4639,"duration":0.6188,"pitch":6,"lyric":"知其不二兮","lane":2,"chord":false,"chordLane":null},{"time":54.2186,"duration":0.219,"pitch":7,"lyric":"知其不二兮","lane":0,"chord":false,"chordLane":null},{"time":54.4856,"duration":0.1904,"pitch":6,"lyric":"尔听斯聪","lane":1,"chord":true,"chordLane":2},{"time":54.7178,"duration":0.1238,"pitch":6,"lyric":"尔听斯聪","lane":3,"chord":false,"chordLane":null},{"time":54.8688,"duration":0.3903,"pitch":6,"lyric":"尔听斯聪","lane":0,"chord":false,"chordLane":null},{"time":55.3448,"duration":0.3427,"pitch":7,"lyric":"尔听斯聪","lane":1,"chord":true,"chordLane":2},{"time":55.7627,"duration":0.5427,"pitch":6,"lyric":"尔听斯聪","lane":0,"chord":true,"chordLane":3},{"time":56.4245,"duration":0.1809,"pitch":6,"lyric":"尔听斯聪","lane":1,"chord":false,"chordLane":null},{"time":56.6451,"duration":0.257,"pitch":6,"lyric":"尔听斯聪","lane":2,"chord":false,"chordLane":null},{"time":56.9585,"duration":0.8663,"pitch":6,"lyric":"尔听斯聪","lane":0,"chord":true,"chordLane":3},{"time":58.0151,"duration":0.4189,"pitch":5,"lyric":"尔听斯聪","lane":1,"chord":false,"chordLane":null},{"time":58.5259,"duration":0.1618,"pitch":5,"lyric":"尔听斯聪","lane":0,"chord":false,"chordLane":null},{"time":58.7233,"duration":0.7902,"pitch":5,"lyric":"尔听斯聪","lane":3,"chord":false,"chordLane":null},{"time":59.6869,"duration":0.95,"pitch":4,"lyric":"尔听斯聪","lane":1,"chord":false,"chordLane":null},{"time":61.6606,"duration":0.3522,"pitch":6,"lyric":"国有成均","lane":0,"chord":true,"chordLane":2},{"time":62.0902,"duration":0.3903,"pitch":6,"lyric":"国有成均","lane":1,"chord":true,"chordLane":3},{"time":62.5662,"duration":0.7616,"pitch":6,"lyric":"国有成均","lane":0,"chord":false,"chordLane":null},{"time":63.495,"duration":0.219,"pitch":6,"lyric":"国有成均","lane":2,"chord":true,"chordLane":3},{"time":63.762,"duration":0.4094,"pitch":6,"lyric":"国有成均","lane":0,"chord":true,"chordLane":1},{"time":64.2612,"duration":0.2856,"pitch":7,"lyric":"国有成均","lane":2,"chord":false,"chordLane":null},{"time":64.6095,"duration":0.5712,"pitch":6,"lyric":"国有成均","lane":0,"chord":true,"chordLane":1},{"time":65.3061,"duration":0.3332,"pitch":6,"lyric":"在浙之滨","lane":2,"chord":true,"chordLane":3},{"time":65.7125,"duration":0.1618,"pitch":6,"lyric":"在浙之滨","lane":0,"chord":false,"chordLane":null},{"time":65.9098,"duration":0.2856,"pitch":6,"lyric":"在浙之滨","lane":1,"chord":false,"chordLane":null},{"time":66.2581,"duration":0.1999,"pitch":6,"lyric":"在浙之滨","lane":2,"chord":true,"chordLane":3},{"time":66.502,"duration":0.95,"pitch":5,"lyric":"在浙之滨","lane":0,"chord":false,"chordLane":null},{"time":68.0577,"duration":0.4474,"pitch":5,"lyric":"在浙之滨","lane":1,"chord":true,"chordLane":3},{"time":68.6034,"duration":0.3998,"pitch":6,"lyric":"在浙之滨","lane":0,"chord":true,"chordLane":2},{"time":69.091,"duration":0.3332,"pitch":6,"lyric":"在浙之滨","lane":1,"chord":false,"chordLane":null},{"time":69.4973,"duration":0.5046,"pitch":6,"lyric":"在浙之滨","lane":0,"chord":true,"chordLane":3},{"time":70.1127,"duration":0.3903,"pitch":6,"lyric":"昔言求是","lane":1,"chord":true,"chordLane":2},{"time":70.5887,"duration":0.95,"pitch":6,"lyric":"昔言求是","lane":0,"chord":false,"chordLane":null},{"time":71.7497,"duration":0.3808,"pitch":6,"lyric":"昔言求是","lane":0,"chord":true,"chordLane":2},{"time":72.2141,"duration":0.4474,"pitch":6,"lyric":"昔言求是","lane":3,"chord":false,"chordLane":null},{"time":72.7597,"duration":0.1523,"pitch":6,"lyric":"昔言求是","lane":2,"chord":false,"chordLane":null},{"time":72.9455,"duration":0.1523,"pitch":6,"lyric":"昔言求是","lane":1,"chord":false,"chordLane":null},{"time":73.1312,"duration":0.1333,"pitch":6,"lyric":"昔言求是","lane":0,"chord":false,"chordLane":null},{"time":73.2938,"duration":0.4379,"pitch":6,"lyric":"昔言求是","lane":3,"chord":false,"chordLane":null},{"time":73.8278,"duration":0.4379,"pitch":5,"lyric":"昔言求是","lane":2,"chord":false,"chordLane":null},{"time":74.3619,"duration":0.238,"pitch":5,"lyric":"昔言求是","lane":0,"chord":true,"chordLane":1},{"time":74.6522,"duration":0.1904,"pitch":6,"lyric":"昔言求是","lane":3,"chord":false,"chordLane":null},{"time":74.8844,"duration":0.219,"pitch":6,"lyric":"昔言求是","lane":0,"chord":true,"chordLane":1},{"time":75.1514,"duration":0.238,"pitch":7,"lyric":"实启尔求真","lane":2,"chord":true,"chordLane":3},{"time":75.4416,"duration":0.1523,"pitch":6,"lyric":"实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":75.6274,"duration":0.1238,"pitch":7,"lyric":"实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":75.7783,"duration":0.1618,"pitch":7,"lyric":"实启尔求真","lane":2,"chord":false,"chordLane":null},{"time":75.9757,"duration":0.1714,"pitch":6,"lyric":"实启尔求真","lane":3,"chord":false,"chordLane":null},{"time":76.1847,"duration":0.1523,"pitch":7,"lyric":"实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":76.3704,"duration":0.3046,"pitch":6,"lyric":"实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":76.742,"duration":0.3998,"pitch":6,"lyric":"实启尔求真","lane":2,"chord":false,"chordLane":null},{"time":77.2296,"duration":0.2856,"pitch":6,"lyric":"实启尔求真","lane":1,"chord":true,"chordLane":3},{"time":77.5779,"duration":0.1238,"pitch":6,"lyric":"实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":77.7288,"duration":0.2951,"pitch":6,"lyric":"实启尔求真","lane":2,"chord":false,"chordLane":null},{"time":78.0887,"duration":0.1714,"pitch":7,"lyric":"实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":78.2977,"duration":0.2951,"pitch":6,"lyric":"实启尔求真","lane":3,"chord":false,"chordLane":null},{"time":78.6576,"duration":0.1618,"pitch":6,"lyric":"实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":78.855,"duration":0.2856,"pitch":6,"lyric":"实启尔求真","lane":2,"chord":false,"chordLane":null},{"time":79.2033,"duration":0.2856,"pitch":6,"lyric":"实启尔求真","lane":1,"chord":true,"chordLane":3},{"time":79.5516,"duration":0.7807,"pitch":6,"lyric":"实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":80.5036,"duration":0.2475,"pitch":5,"lyric":"实启尔求真","lane":1,"chord":true,"chordLane":2},{"time":80.8054,"duration":0.4474,"pitch":5,"lyric":"实启尔求真","lane":0,"chord":true,"chordLane":3},{"time":81.3511,"duration":0.714,"pitch":6,"lyric":"实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":82.2219,"duration":0.1428,"pitch":5,"lyric":"实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":82.396,"duration":0.2475,"pitch":6,"lyric":"实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":82.6979,"duration":0.2285,"pitch":6,"lyric":"实启尔求真","lane":2,"chord":false,"chordLane":null},{"time":82.9765,"duration":0.4094,"pitch":6,"lyric":"实启尔求真","lane":0,"chord":true,"chordLane":3},{"time":83.4757,"duration":0.4379,"pitch":5,"lyric":"实启尔求真","lane":1,"chord":true,"chordLane":2},{"time":84.0098,"duration":0.2094,"pitch":6,"lyric":"实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":84.2652,"duration":0.219,"pitch":6,"lyric":"实启尔求真","lane":1,"chord":true,"chordLane":3},{"time":84.5322,"duration":0.5331,"pitch":5,"lyric":"实启尔求真","lane":0,"chord":true,"chordLane":2},{"time":85.1824,"duration":0.1999,"pitch":6,"lyric":"大不自多","lane":1,"chord":false,"chordLane":null},{"time":85.4262,"duration":0.1523,"pitch":6,"lyric":"大不自多","lane":3,"chord":false,"chordLane":null},{"time":85.612,"duration":0.2285,"pitch":6,"lyric":"大不自多","lane":0,"chord":false,"chordLane":null},{"time":85.8906,"duration":0.476,"pitch":6,"lyric":"大不自多","lane":2,"chord":false,"chordLane":null},{"time":86.4711,"duration":0.1714,"pitch":6,"lyric":"大不自多","lane":1,"chord":false,"chordLane":null},{"time":86.6801,"duration":0.8473,"pitch":6,"lyric":"大不自多","lane":0,"chord":false,"chordLane":null},{"time":87.7134,"duration":0.3618,"pitch":5,"lyric":"大不自多","lane":3,"chord":false,"chordLane":null},{"time":88.1546,"duration":0.238,"pitch":6,"lyric":"大不自多","lane":0,"chord":true,"chordLane":1},{"time":88.4448,"duration":0.3618,"pitch":6,"lyric":"大不自多","lane":2,"chord":true,"chordLane":3},{"time":88.886,"duration":0.3903,"pitch":5,"lyric":"大不自多","lane":0,"chord":false,"chordLane":null},{"time":89.362,"duration":0.476,"pitch":5,"lyric":"大不自多","lane":1,"chord":true,"chordLane":3},{"time":89.9425,"duration":0.4379,"pitch":6,"lyric":"大不自多","lane":0,"chord":true,"chordLane":2},{"time":90.4766,"duration":0.3808,"pitch":6,"lyric":"海纳江河","lane":1,"chord":false,"chordLane":null},{"time":90.941,"duration":0.476,"pitch":6,"lyric":"海纳江河","lane":0,"chord":true,"chordLane":3},{"time":91.5215,"duration":0.1809,"pitch":6,"lyric":"海纳江河","lane":1,"chord":false,"chordLane":null},{"time":91.742,"duration":0.1999,"pitch":7,"lyric":"海纳江河","lane":2,"chord":false,"chordLane":null},{"time":91.9859,"duration":0.1999,"pitch":7,"lyric":"海纳江河","lane":0,"chord":true,"chordLane":3},{"time":92.2297,"duration":0.4284,"pitch":6,"lyric":"海纳江河","lane":1,"chord":true,"chordLane":2},{"time":92.7521,"duration":0.2951,"pitch":6,"lyric":"海纳江河","lane":0,"chord":false,"chordLane":null},{"time":93.112,"duration":0.6759,"pitch":6,"lyric":"海纳江河","lane":2,"chord":true,"chordLane":3},{"time":93.9363,"duration":0.6664,"pitch":6,"lyric":"海纳江河","lane":0,"chord":true,"chordLane":1},{"time":94.749,"duration":0.6664,"pitch":6,"lyric":"海纳江河","lane":2,"chord":false,"chordLane":null},{"time":95.5617,"duration":0.2951,"pitch":6,"lyric":"海纳江河","lane":0,"chord":true,"chordLane":1},{"time":95.9216,"duration":0.95,"pitch":6,"lyric":"海纳江河","lane":2,"chord":true,"chordLane":3},{"time":100.1825,"duration":0.1523,"pitch":6,"lyric":"海纳江河","lane":2,"chord":false,"chordLane":null},{"time":100.3683,"duration":0.1523,"pitch":6,"lyric":"大不自多","lane":1,"chord":false,"chordLane":null},{"time":100.554,"duration":0.1428,"pitch":6,"lyric":"大不自多","lane":0,"chord":false,"chordLane":null},{"time":100.7282,"duration":0.4094,"pitch":6,"lyric":"大不自多","lane":3,"chord":false,"chordLane":null},{"time":101.2274,"duration":0.4284,"pitch":5,"lyric":"大不自多","lane":1,"chord":true,"chordLane":2},{"time":101.7498,"duration":0.1809,"pitch":5,"lyric":"大不自多","lane":0,"chord":false,"chordLane":null},{"time":101.9704,"duration":0.695,"pitch":6,"lyric":"大不自多","lane":3,"chord":false,"chordLane":null},{"time":102.818,"duration":0.3237,"pitch":5,"lyric":"大不自多","lane":2,"chord":false,"chordLane":null},{"time":103.2127,"duration":0.1714,"pitch":7,"lyric":"大不自多","lane":3,"chord":false,"chordLane":null},{"time":103.4217,"duration":0.219,"pitch":7,"lyric":"大不自多","lane":0,"chord":false,"chordLane":null},{"time":103.6887,"duration":0.2761,"pitch":6,"lyric":"大不自多","lane":1,"chord":true,"chordLane":2},{"time":104.0254,"duration":0.3427,"pitch":6,"lyric":"大不自多","lane":0,"chord":true,"chordLane":3},{"time":104.4434,"duration":0.1999,"pitch":5,"lyric":"大不自多","lane":1,"chord":false,"chordLane":null},{"time":104.6872,"duration":0.4284,"pitch":6,"lyric":"大不自多","lane":0,"chord":true,"chordLane":3},{"time":105.2096,"duration":0.5427,"pitch":6,"lyric":"海纳江河","lane":1,"chord":true,"chordLane":2},{"time":105.8714,"duration":0.1333,"pitch":5,"lyric":"海纳江河","lane":0,"chord":false,"chordLane":null},{"time":106.0339,"duration":0.1428,"pitch":5,"lyric":"海纳江河","lane":3,"chord":false,"chordLane":null},{"time":106.2081,"duration":0.5903,"pitch":5,"lyric":"海纳江河","lane":1,"chord":false,"chordLane":null},{"time":106.9279,"duration":0.2094,"pitch":6,"lyric":"海纳江河","lane":0,"chord":false,"chordLane":null},{"time":107.1833,"duration":0.2666,"pitch":6,"lyric":"海纳江河","lane":3,"chord":false,"chordLane":null},{"time":107.5084,"duration":0.1333,"pitch":6,"lyric":"海纳江河","lane":2,"chord":false,"chordLane":null},{"time":107.6709,"duration":0.219,"pitch":5,"lyric":"海纳江河","lane":1,"chord":false,"chordLane":null},{"time":107.938,"duration":0.4189,"pitch":6,"lyric":"海纳江河","lane":0,"chord":false,"chordLane":null},{"time":108.4488,"duration":0.2285,"pitch":5,"lyric":"海纳江河","lane":2,"chord":false,"chordLane":null},{"time":108.7274,"duration":0.6474,"pitch":5,"lyric":"海纳江河","lane":1,"chord":false,"chordLane":null},{"time":109.5169,"duration":0.4474,"pitch":6,"lyric":"海纳江河","lane":0,"chord":false,"chordLane":null},{"time":110.0626,"duration":0.2094,"pitch":5,"lyric":"惟学无际","lane":3,"chord":false,"chordLane":null},{"time":110.318,"duration":0.2285,"pitch":5,"lyric":"惟学无际","lane":2,"chord":false,"chordLane":null},{"time":110.5966,"duration":0.8759,"pitch":6,"lyric":"惟学无际","lane":0,"chord":false,"chordLane":null},{"time":111.6648,"duration":0.95,"pitch":5,"lyric":"惟学无际","lane":0,"chord":true,"chordLane":1},{"time":113.2669,"duration":0.5617,"pitch":6,"lyric":"惟学无际","lane":0,"chord":false,"chordLane":null},{"time":113.9519,"duration":0.1523,"pitch":6,"lyric":"惟学无际","lane":3,"chord":false,"chordLane":null},{"time":114.1377,"duration":0.95,"pitch":6,"lyric":"惟学无际","lane":2,"chord":false,"chordLane":null},{"time":115.5193,"duration":0.3903,"pitch":5,"lyric":"际于天地","lane":0,"chord":false,"chordLane":null},{"time":115.9953,"duration":0.1999,"pitch":5,"lyric":"际于天地","lane":3,"chord":false,"chordLane":null},{"time":116.2391,"duration":0.1999,"pitch":5,"lyric":"际于天地","lane":2,"chord":false,"chordLane":null},{"time":116.4829,"duration":0.1999,"pitch":5,"lyric":"际于天地","lane":1,"chord":false,"chordLane":null},{"time":116.7267,"duration":0.1999,"pitch":5,"lyric":"际于天地","lane":0,"chord":false,"chordLane":null},{"time":116.9705,"duration":0.3903,"pitch":5,"lyric":"际于天地","lane":2,"chord":true,"chordLane":3},{"time":117.4465,"duration":0.1999,"pitch":5,"lyric":"际于天地","lane":1,"chord":false,"chordLane":null},{"time":117.6903,"duration":0.1999,"pitch":5,"lyric":"际于天地","lane":0,"chord":false,"chordLane":null},{"time":117.9341,"duration":0.3998,"pitch":5,"lyric":"际于天地","lane":2,"chord":false,"chordLane":null},{"time":118.4218,"duration":0.3998,"pitch":5,"lyric":"际于天地","lane":3,"chord":false,"chordLane":null},{"time":118.9094,"duration":0.1904,"pitch":5,"lyric":"际于天地","lane":2,"chord":false,"chordLane":null},{"time":119.1416,"duration":0.1999,"pitch":5,"lyric":"际于天地","lane":1,"chord":false,"chordLane":null},{"time":119.3854,"duration":0.1999,"pitch":6,"lyric":"际于天地","lane":0,"chord":false,"chordLane":null},{"time":119.6292,"duration":0.1999,"pitch":5,"lyric":"际于天地","lane":3,"chord":false,"chordLane":null},{"time":119.873,"duration":0.3903,"pitch":5,"lyric":"际于天地","lane":2,"chord":false,"chordLane":null},{"time":120.349,"duration":0.1999,"pitch":5,"lyric":"形上谓道兮 · 形下谓器","lane":1,"chord":false,"chordLane":null},{"time":120.5928,"duration":0.1999,"pitch":5,"lyric":"形上谓道兮 · 形下谓器","lane":0,"chord":false,"chordLane":null},{"time":120.8366,"duration":0.5712,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":3,"chord":false,"chordLane":null},{"time":121.5332,"duration":0.2856,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":1,"chord":true,"chordLane":2},{"time":121.8815,"duration":0.1714,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":0,"chord":false,"chordLane":null},{"time":122.0905,"duration":0.1714,"pitch":7,"lyric":"形上谓道兮 · 形下谓器","lane":3,"chord":false,"chordLane":null},{"time":122.2995,"duration":0.1714,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":1,"chord":false,"chordLane":null},{"time":122.5085,"duration":0.3046,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":2,"chord":false,"chordLane":null},{"time":122.88,"duration":0.4474,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":0,"chord":true,"chordLane":3},{"time":123.4257,"duration":0.6664,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":1,"chord":true,"chordLane":2},{"time":124.2384,"duration":0.257,"pitch":5,"lyric":"形上谓道兮 · 形下谓器","lane":0,"chord":true,"chordLane":3},{"time":124.5518,"duration":0.1428,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":1,"chord":false,"chordLane":null},{"time":124.726,"duration":0.5903,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":2,"chord":false,"chordLane":null},{"time":125.4458,"duration":0.2285,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":0,"chord":true,"chordLane":3},{"time":125.7244,"duration":0.1238,"pitch":5,"lyric":"形上谓道兮 · 形下谓器","lane":1,"chord":false,"chordLane":null},{"time":125.8754,"duration":0.1428,"pitch":5,"lyric":"形上谓道兮 · 形下谓器","lane":2,"chord":false,"chordLane":null},{"time":126.0495,"duration":0.695,"pitch":5,"lyric":"形上谓道兮 · 形下谓器","lane":0,"chord":false,"chordLane":null},{"time":126.8971,"duration":0.3332,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":1,"chord":true,"chordLane":2},{"time":127.3034,"duration":0.1714,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":0,"chord":false,"chordLane":null},{"time":127.5124,"duration":0.1809,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":3,"chord":false,"chordLane":null},{"time":127.733,"duration":0.3998,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":2,"chord":false,"chordLane":null},{"time":128.2206,"duration":0.1238,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":1,"chord":false,"chordLane":null},{"time":128.3715,"duration":0.1999,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":0,"chord":false,"chordLane":null},{"time":128.6153,"duration":0.3522,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":2,"chord":true,"chordLane":3},{"time":129.0449,"duration":0.5046,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":0,"chord":true,"chordLane":1},{"time":129.6602,"duration":0.3713,"pitch":6,"lyric":"形上谓道兮 · 形下谓器","lane":2,"chord":true,"chordLane":3},{"time":130.113,"duration":0.3332,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":true,"chordLane":1},{"time":130.5194,"duration":0.2951,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":2,"chord":true,"chordLane":3},{"time":130.8793,"duration":0.1618,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":false,"chordLane":null},{"time":131.0766,"duration":0.1714,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":1,"chord":false,"chordLane":null},{"time":131.2856,"duration":0.2666,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":2,"chord":false,"chordLane":null},{"time":131.6107,"duration":0.1428,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":3,"chord":false,"chordLane":null},{"time":131.7849,"duration":0.1428,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":false,"chordLane":null},{"time":131.959,"duration":0.257,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":1,"chord":false,"chordLane":null},{"time":132.2725,"duration":0.4094,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":2,"chord":true,"chordLane":3},{"time":132.7717,"duration":0.1904,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":true,"chordLane":1},{"time":133.0039,"duration":0.1714,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":2,"chord":false,"chordLane":null},{"time":133.2129,"duration":0.1809,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":3,"chord":false,"chordLane":null},{"time":133.4335,"duration":0.4379,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":false,"chordLane":null},{"time":133.9675,"duration":0.1333,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":1,"chord":false,"chordLane":null},{"time":134.1301,"duration":0.1428,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":2,"chord":false,"chordLane":null},{"time":134.3042,"duration":0.1238,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":3,"chord":false,"chordLane":null},{"time":134.4551,"duration":0.1523,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":false,"chordLane":null},{"time":134.6409,"duration":0.1809,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":1,"chord":false,"chordLane":null},{"time":134.8615,"duration":0.5427,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":2,"chord":false,"chordLane":null},{"time":135.5233,"duration":0.2666,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":true,"chordLane":3},{"time":135.8483,"duration":0.3142,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":1,"chord":true,"chordLane":2},{"time":136.2315,"duration":0.1714,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":3,"chord":false,"chordLane":null},{"time":136.4405,"duration":0.3522,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":false,"chordLane":null},{"time":136.87,"duration":0.2094,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":1,"chord":true,"chordLane":2},{"time":137.1254,"duration":0.1999,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":true,"chordLane":3},{"time":137.3693,"duration":0.1523,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":2,"chord":false,"chordLane":null},{"time":137.555,"duration":0.1809,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":1,"chord":false,"chordLane":null},{"time":137.7756,"duration":0.4474,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":false,"chordLane":null},{"time":138.3213,"duration":0.219,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":2,"chord":true,"chordLane":3},{"time":138.5883,"duration":0.2285,"pitch":5,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":true,"chordLane":1},{"time":138.8669,"duration":0.1428,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":2,"chord":false,"chordLane":null},{"time":139.0411,"duration":0.1428,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":3,"chord":false,"chordLane":null},{"time":139.2152,"duration":0.4189,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":false,"chordLane":null},{"time":139.7261,"duration":0.1904,"pitch":6,"lyric":"礼主别异兮 · 乐主和同","lane":1,"chord":true,"chordLane":2},{"time":139.9583,"duration":0.1999,"pitch":7,"lyric":"礼主别异兮 · 乐主和同","lane":0,"chord":true,"chordLane":3},{"time":140.2021,"duration":0.1523,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":false,"chordLane":null},{"time":140.3878,"duration":0.2475,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":2,"chord":false,"chordLane":null},{"time":140.6897,"duration":0.3903,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":true,"chordLane":3},{"time":141.1657,"duration":0.2094,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":true,"chordLane":2},{"time":141.4211,"duration":0.1904,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":true,"chordLane":3},{"time":141.6533,"duration":0.2094,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":true,"chordLane":2},{"time":141.9088,"duration":0.1809,"pitch":5,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":false,"chordLane":null},{"time":142.1293,"duration":0.1999,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":3,"chord":false,"chordLane":null},{"time":142.3732,"duration":0.2285,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":true,"chordLane":2},{"time":142.6518,"duration":0.1809,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":false,"chordLane":null},{"time":142.8724,"duration":0.1904,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":3,"chord":false,"chordLane":null},{"time":143.1046,"duration":0.219,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":true,"chordLane":2},{"time":143.3716,"duration":0.1809,"pitch":5,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":false,"chordLane":null},{"time":143.5922,"duration":0.1904,"pitch":5,"lyric":"知其不二兮 · 尔听斯聪","lane":3,"chord":false,"chordLane":null},{"time":143.8244,"duration":0.1999,"pitch":5,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":true,"chordLane":2},{"time":144.0682,"duration":0.1333,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":false,"chordLane":null},{"time":144.2307,"duration":0.2856,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":3,"chord":false,"chordLane":null},{"time":144.579,"duration":0.2094,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":true,"chordLane":2},{"time":144.8345,"duration":0.1999,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":true,"chordLane":3},{"time":145.0783,"duration":0.1618,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":2,"chord":false,"chordLane":null},{"time":145.2756,"duration":0.2094,"pitch":5,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":false,"chordLane":null},{"time":145.5311,"duration":0.1428,"pitch":5,"lyric":"知其不二兮 · 尔听斯聪","lane":3,"chord":false,"chordLane":null},{"time":145.7052,"duration":0.257,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":false,"chordLane":null},{"time":146.0187,"duration":0.1428,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":2,"chord":false,"chordLane":null},{"time":146.1928,"duration":0.2285,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":false,"chordLane":null},{"time":146.4715,"duration":0.4189,"pitch":7,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":true,"chordLane":3},{"time":146.9823,"duration":0.1714,"pitch":5,"lyric":"知其不二兮 · 尔听斯聪","lane":2,"chord":false,"chordLane":null},{"time":147.1913,"duration":0.219,"pitch":5,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":false,"chordLane":null},{"time":147.4583,"duration":0.1428,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":false,"chordLane":null},{"time":147.6325,"duration":0.257,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":3,"chord":false,"chordLane":null},{"time":147.9459,"duration":0.1333,"pitch":7,"lyric":"知其不二兮 · 尔听斯聪","lane":2,"chord":false,"chordLane":null},{"time":148.1085,"duration":0.257,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":false,"chordLane":null},{"time":148.422,"duration":0.1714,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":false,"chordLane":null},{"time":148.6309,"duration":0.2285,"pitch":7,"lyric":"知其不二兮 · 尔听斯聪","lane":3,"chord":false,"chordLane":null},{"time":148.9096,"duration":0.3903,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":true,"chordLane":2},{"time":149.3856,"duration":0.1999,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":true,"chordLane":3},{"time":149.6294,"duration":0.2094,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":1,"chord":true,"chordLane":2},{"time":149.8848,"duration":0.95,"pitch":6,"lyric":"知其不二兮 · 尔听斯聪","lane":0,"chord":true,"chordLane":3},{"time":151.0922,"duration":0.3427,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":2,"chord":true,"chordLane":3},{"time":151.5102,"duration":0.1238,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":0,"chord":false,"chordLane":null},{"time":151.6611,"duration":0.1333,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":1,"chord":false,"chordLane":null},{"time":151.8237,"duration":0.5617,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":2,"chord":false,"chordLane":null},{"time":152.5087,"duration":0.1904,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":0,"chord":true,"chordLane":3},{"time":152.7409,"duration":0.1714,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":2,"chord":false,"chordLane":null},{"time":152.9498,"duration":0.495,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":1,"chord":false,"chordLane":null},{"time":153.5536,"duration":0.2761,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":0,"chord":true,"chordLane":3},{"time":153.8902,"duration":0.1523,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":2,"chord":false,"chordLane":null},{"time":154.076,"duration":0.3142,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":1,"chord":false,"chordLane":null},{"time":154.4591,"duration":0.2285,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":0,"chord":true,"chordLane":3},{"time":154.7378,"duration":0.1714,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":2,"chord":false,"chordLane":null},{"time":154.9468,"duration":0.3142,"pitch":7,"lyric":"国有成均 · 在浙之滨","lane":1,"chord":false,"chordLane":null},{"time":155.3299,"duration":0.238,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":0,"chord":true,"chordLane":3},{"time":155.6201,"duration":0.1523,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":2,"chord":false,"chordLane":null},{"time":155.8059,"duration":0.219,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":1,"chord":false,"chordLane":null},{"time":156.0729,"duration":0.2856,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":0,"chord":true,"chordLane":3},{"time":156.4212,"duration":0.257,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":1,"chord":true,"chordLane":2},{"time":156.7347,"duration":0.219,"pitch":6,"lyric":"国有成均 · 在浙之滨","lane":0,"chord":true,"chordLane":3},{"time":157.0017,"duration":0.1999,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":1,"chord":true,"chordLane":2},{"time":157.2455,"duration":0.1333,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":3,"chord":false,"chordLane":null},{"time":157.4081,"duration":0.1428,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":157.5822,"duration":0.1428,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":157.7564,"duration":0.1428,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":2,"chord":false,"chordLane":null},{"time":157.9305,"duration":0.1238,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":3,"chord":false,"chordLane":null},{"time":158.0815,"duration":0.1238,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":158.2324,"duration":0.1714,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":158.4414,"duration":0.4189,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":2,"chord":false,"chordLane":null},{"time":158.9522,"duration":0.1618,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":3,"chord":false,"chordLane":null},{"time":159.1496,"duration":0.1618,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":159.3469,"duration":0.1999,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":159.5907,"duration":0.219,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":2,"chord":true,"chordLane":3},{"time":159.8578,"duration":0.1523,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":160.0435,"duration":0.1333,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":160.2061,"duration":0.1714,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":2,"chord":false,"chordLane":null},{"time":160.4151,"duration":0.1238,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":3,"chord":false,"chordLane":null},{"time":160.566,"duration":0.1618,"pitch":7,"lyric":"昔言求是 · 实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":160.7634,"duration":0.4379,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":161.2974,"duration":0.1238,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":2,"chord":false,"chordLane":null},{"time":161.4483,"duration":0.2666,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":3,"chord":false,"chordLane":null},{"time":161.7734,"duration":0.2475,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":0,"chord":true,"chordLane":1},{"time":162.0753,"duration":0.1999,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":2,"chord":true,"chordLane":3},{"time":162.3191,"duration":0.1333,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":1,"chord":false,"chordLane":null},{"time":162.4816,"duration":0.2094,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":0,"chord":false,"chordLane":null},{"time":162.7371,"duration":0.2666,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":2,"chord":true,"chordLane":3},{"time":163.0621,"duration":0.3618,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":0,"chord":true,"chordLane":1},{"time":163.5033,"duration":0.1999,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":2,"chord":true,"chordLane":3},{"time":163.7471,"duration":0.3046,"pitch":6,"lyric":"昔言求是 · 实启尔求真","lane":0,"chord":true,"chordLane":1},{"time":164.1186,"duration":0.1618,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":3,"chord":false,"chordLane":null},{"time":164.316,"duration":0.2285,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":2,"chord":false,"chordLane":null},{"time":164.5946,"duration":0.1999,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":0,"chord":true,"chordLane":1},{"time":164.8385,"duration":0.238,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":2,"chord":true,"chordLane":3},{"time":165.1287,"duration":0.1428,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":0,"chord":false,"chordLane":null},{"time":165.3029,"duration":0.1238,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":1,"chord":false,"chordLane":null},{"time":165.4538,"duration":0.1523,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":2,"chord":false,"chordLane":null},{"time":165.6395,"duration":0.1714,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":3,"chord":false,"chordLane":null},{"time":165.8485,"duration":0.2094,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":0,"chord":false,"chordLane":null},{"time":166.1039,"duration":0.1238,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":1,"chord":false,"chordLane":null},{"time":166.2549,"duration":0.1428,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":2,"chord":false,"chordLane":null},{"time":166.429,"duration":0.574,"pitch":6,"lyric":"大不自多 · 海纳江河","lane":3,"chord":false,"chordLane":null}],"lyrics":[{"time":13.444,"char":"大","phrase":0},{"time":14.211,"char":"不","phrase":0},{"time":14.878,"char":"自","phrase":0},{"time":15.453,"char":"多","phrase":0},{"time":17.386,"char":"海","phrase":1},{"time":18.094,"char":"纳","phrase":1},{"time":19.151,"char":"江","phrase":1},{"time":19.876,"char":"河","phrase":1},{"time":21.612,"char":"惟","phrase":2},{"time":22.965,"char":"学","phrase":2},{"time":24.294,"char":"无","phrase":2},{"time":25.49,"char":"际","phrase":2},{"time":27.074,"char":"际","phrase":3},{"time":27.957,"char":"于","phrase":3},{"time":28.793,"char":"天","phrase":3},{"time":29.814,"char":"地","phrase":3},{"time":30.273,"char":"形","phrase":4},{"time":31.219,"char":"上","phrase":4},{"time":31.939,"char":"谓","phrase":4},{"time":32.717,"char":"道","phrase":4},{"time":33.692,"char":"兮","phrase":4},{"time":34.946,"char":"形","phrase":5},{"time":36.124,"char":"下","phrase":5},{"time":37.326,"char":"谓","phrase":5},{"time":38.499,"char":"器","phrase":5},{"time":39.584,"char":"礼","phrase":6},{"time":40.652,"char":"主","phrase":6},{"time":41.465,"char":"别","phrase":6},{"time":42.591,"char":"异","phrase":6},{"time":43.404,"char":"兮","phrase":6},{"time":44.815,"char":"乐","phrase":7},{"time":46.051,"char":"主","phrase":7},{"time":47.067,"char":"和","phrase":7},{"time":48.402,"char":"同","phrase":7},{"time":49.546,"char":"知","phrase":8},{"time":50.753,"char":"其","phrase":8},{"time":51.856,"char":"不","phrase":8},{"time":52.663,"char":"二","phrase":8},{"time":54.021,"char":"兮","phrase":8},{"time":54.666,"char":"尔","phrase":9},{"time":56.175,"char":"听","phrase":9},{"time":57.469,"char":"斯","phrase":9},{"time":58.88,"char":"聪","phrase":9},{"time":61.765,"char":"国","phrase":10},{"time":62.63,"char":"有","phrase":10},{"time":63.414,"char":"成","phrase":10},{"time":64.517,"char":"均","phrase":10},{"time":65.306,"char":"在","phrase":11},{"time":66.612,"char":"浙","phrase":11},{"time":67.767,"char":"之","phrase":11},{"time":68.899,"char":"滨","phrase":11},{"time":70.473,"char":"昔","phrase":12},{"time":71.61,"char":"言","phrase":12},{"time":72.678,"char":"求","phrase":12},{"time":74.217,"char":"是","phrase":12},{"time":75.366,"char":"实","phrase":13},{"time":77.386,"char":"启","phrase":13},{"time":79.424,"char":"尔","phrase":13},{"time":81.235,"char":"求","phrase":13},{"time":83.331,"char":"真","phrase":13},{"time":85.299,"char":"大","phrase":14},{"time":86.721,"char":"不","phrase":14},{"time":87.928,"char":"自","phrase":14},{"time":89.246,"char":"多","phrase":14},{"time":90.831,"char":"海","phrase":15},{"time":93.141,"char":"纳","phrase":15},{"time":95.939,"char":"江","phrase":15},{"time":98.714,"char":"河","phrase":15},{"time":100.391,"char":"大","phrase":16},{"time":101.895,"char":"不","phrase":16},{"time":102.986,"char":"自","phrase":16},{"time":103.95,"char":"多","phrase":16},{"time":105.361,"char":"海","phrase":17},{"time":106.574,"char":"纳","phrase":17},{"time":107.857,"char":"江","phrase":17},{"time":108.89,"char":"河","phrase":17},{"time":110.266,"char":"惟","phrase":18},{"time":111.392,"char":"学","phrase":18},{"time":112.541,"char":"无","phrase":18},{"time":113.958,"char":"际","phrase":18},{"time":115.902,"char":"际","phrase":19},{"time":116.854,"char":"于","phrase":19},{"time":118.3,"char":"天","phrase":19},{"time":119.298,"char":"地","phrase":19},{"time":120.517,"char":"形","phrase":20},{"time":121.214,"char":"上","phrase":20},{"time":122.781,"char":"谓","phrase":20},{"time":123.803,"char":"道","phrase":20},{"time":124.848,"char":"兮","phrase":20},{"time":125.991,"char":"形","phrase":20},{"time":127.054,"char":"下","phrase":20},{"time":128.023,"char":"谓","phrase":20},{"time":129.486,"char":"器","phrase":20},{"time":130.229,"char":"礼","phrase":21},{"time":131.431,"char":"主","phrase":21},{"time":132.412,"char":"别","phrase":21},{"time":133.84,"char":"异","phrase":21},{"time":134.885,"char":"兮","phrase":21},{"time":136.11,"char":"乐","phrase":21},{"time":137.201,"char":"主","phrase":21},{"time":138.182,"char":"和","phrase":21},{"time":139.645,"char":"同","phrase":21},{"time":140.231,"char":"知","phrase":22},{"time":141.549,"char":"其","phrase":22},{"time":142.536,"char":"不","phrase":22},{"time":143.987,"char":"二","phrase":22},{"time":145.02,"char":"兮","phrase":22},{"time":145.891,"char":"尔","phrase":22},{"time":147.209,"char":"听","phrase":22},{"time":148.3,"char":"斯","phrase":22},{"time":149.484,"char":"聪","phrase":22},{"time":151.185,"char":"国","phrase":23},{"time":151.882,"char":"有","phrase":23},{"time":152.718,"char":"成","phrase":23},{"time":153.461,"char":"均","phrase":23},{"time":154.25,"char":"在","phrase":23},{"time":155.237,"char":"浙","phrase":23},{"time":155.864,"char":"之","phrase":23},{"time":156.671,"char":"滨","phrase":23},{"time":157.124,"char":"昔","phrase":24},{"time":157.884,"char":"言","phrase":24},{"time":158.755,"char":"求","phrase":24},{"time":159.48,"char":"是","phrase":24},{"time":160.357,"char":"实","phrase":24},{"time":161.187,"char":"启","phrase":24},{"time":162.006,"char":"尔","phrase":24},{"time":162.824,"char":"求","phrase":24},{"time":163.521,"char":"真","phrase":24},{"time":164.229,"char":"大","phrase":25},{"time":164.525,"char":"不","phrase":25},{"time":164.92,"char":"自","phrase":25},{"time":165.198,"char":"多","phrase":25},{"time":165.57,"char":"海","phrase":25},{"time":166.005,"char":"纳","phrase":25},{"time":166.377,"char":"江","phrase":25},{"time":166.731,"char":"河","phrase":25}]}
+\ No newline at end of file
++{"duration":172.225306,"beat":0.476134,"source":"浙江大学文琴合唱团《浙江大学校歌》；完整确认歌词 + Demucs 人声强制对齐","vocalOrigin":28.5,"notes":[{"time":9.021,"duration":0.95,"pitch":6,"lyric":"前奏","lane":2,"chord":false,"chordLane":null,"vocal":false},{"time":28.5,"duration":0.5514,"pitch":6,"lyric":"大","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":29.1725,"duration":0.3608,"pitch":6,"lyric":"不","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":29.612499999999997,"duration":0.4428,"pitch":6,"lyric":"自","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":30.1525,"duration":0.8589,"pitch":5,"lyric":"多","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":31.4,"duration":0.3219,"pitch":5,"lyric":"海","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":31.7925,"duration":0.8036,"pitch":6,"lyric":"纳","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":32.7725,"duration":0.492,"pitch":5,"lyric":"江","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":33.3725,"duration":0.5965,"pitch":6,"lyric":"河","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":34.5,"duration":0.4203,"pitch":6,"lyric":"惟","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":35.0125,"duration":0.9184,"pitch":6,"lyric":"学","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":36.1325,"duration":0.3444,"pitch":5,"lyric":"无","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":36.5525,"duration":0.95,"pitch":6,"lyric":"际","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":38.2,"duration":0.4858,"pitch":6,"lyric":"际","lane":3,"chord":true,"chordLane":1,"vocal":true},{"time":38.7925,"duration":0.4264,"pitch":5,"lyric":"于","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":39.3125,"duration":0.5084,"pitch":6,"lyric":"天","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":39.9325,"duration":0.5474,"pitch":6,"lyric":"地","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":41.0,"duration":0.4038,"pitch":6,"lyric":"形","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":41.4925,"duration":0.9348,"pitch":6,"lyric":"上","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":42.6325,"duration":0.4264,"pitch":6,"lyric":"谓","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":43.1525,"duration":0.8856,"pitch":6,"lyric":"道","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":44.2325,"duration":0.3834,"pitch":6,"lyric":"兮","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":44.8,"duration":0.4531,"pitch":6,"lyric":"形","lane":0,"chord":true,"chordLane":2,"vocal":true},{"time":45.3525,"duration":0.4592,"pitch":6,"lyric":"下","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":45.9125,"duration":0.4592,"pitch":5,"lyric":"谓","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":46.4725,"duration":0.9246,"pitch":6,"lyric":"器","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":48.1,"duration":0.4366,"pitch":4,"lyric":"礼","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":48.6325,"duration":0.4592,"pitch":6,"lyric":"主","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":49.1925,"duration":0.6232,"pitch":6,"lyric":"别","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":49.9525,"duration":0.6888,"pitch":6,"lyric":"异","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":50.792500000000004,"duration":0.4161,"pitch":7,"lyric":"兮","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":51.5,"duration":0.3711,"pitch":6,"lyric":"乐","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":51.9525,"duration":0.3936,"pitch":6,"lyric":"主","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":52.432500000000005,"duration":0.4592,"pitch":6,"lyric":"和","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":52.99250000000001,"duration":0.7441,"pitch":7,"lyric":"同","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":54.1,"duration":0.1907,"pitch":6,"lyric":"知","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":54.3325,"duration":0.246,"pitch":5,"lyric":"其","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":54.63250000000001,"duration":0.5576,"pitch":5,"lyric":"不","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":55.3125,"duration":0.2788,"pitch":6,"lyric":"二","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":55.6525,"duration":0.4489,"pitch":6,"lyric":"兮","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":56.3,"duration":0.4531,"pitch":6,"lyric":"尔","lane":0,"chord":true,"chordLane":2,"vocal":true},{"time":56.852500000000006,"duration":0.4592,"pitch":6,"lyric":"听","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":57.4125,"duration":0.492,"pitch":5,"lyric":"斯","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":58.0125,"duration":0.95,"pitch":6,"lyric":"聪","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":61.2,"duration":0.5022,"pitch":6,"lyric":"国","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":61.8125,"duration":0.4756,"pitch":6,"lyric":"有","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":62.3925,"duration":0.3936,"pitch":6,"lyric":"成","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":62.8725,"duration":0.8425,"pitch":6,"lyric":"均","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":64.0,"duration":0.4695,"pitch":6,"lyric":"在","lane":0,"chord":true,"chordLane":2,"vocal":true},{"time":64.5725,"duration":0.8692,"pitch":7,"lyric":"浙","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":65.63250000000001,"duration":0.4428,"pitch":7,"lyric":"之","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":66.1725,"duration":0.9245,"pitch":7,"lyric":"滨","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":67.8,"duration":0.4695,"pitch":6,"lyric":"昔","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":68.3725,"duration":0.3936,"pitch":6,"lyric":"言","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":68.8525,"duration":0.4592,"pitch":6,"lyric":"求","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":69.41250000000001,"duration":0.8917,"pitch":6,"lyric":"是","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":70.8,"duration":0.1414,"pitch":5,"lyric":"实","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":70.9725,"duration":0.2132,"pitch":5,"lyric":"启","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":71.2325,"duration":0.7216,"pitch":6,"lyric":"尔","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":72.1125,"duration":0.4592,"pitch":6,"lyric":"求","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":72.6725,"duration":0.9245,"pitch":5,"lyric":"真","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":74.4,"duration":0.3874,"pitch":6,"lyric":"习","lane":0,"chord":true,"chordLane":2,"vocal":true},{"time":74.8725,"duration":0.4264,"pitch":6,"lyric":"坎","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":75.3925,"duration":0.4264,"pitch":6,"lyric":"示","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":75.91250000000001,"duration":0.8097,"pitch":5,"lyric":"教","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":77.0,"duration":0.4366,"pitch":6,"lyric":"始","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":77.5325,"duration":0.8528,"pitch":6,"lyric":"见","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":78.5725,"duration":0.5084,"pitch":6,"lyric":"经","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":79.1925,"duration":0.7441,"pitch":6,"lyric":"纶","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":80.3,"duration":0.3875,"pitch":6,"lyric":"无","lane":0,"chord":true,"chordLane":2,"vocal":true},{"time":80.77250000000001,"duration":0.1804,"pitch":6,"lyric":"曰","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":80.9925,"duration":0.2624,"pitch":6,"lyric":"已","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":81.3125,"duration":0.3178,"pitch":5,"lyric":"是","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":81.9,"duration":0.3874,"pitch":7,"lyric":"无","lane":3,"chord":true,"chordLane":1,"vocal":true},{"time":82.3725,"duration":0.1968,"pitch":6,"lyric":"曰","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":82.6125,"duration":0.1968,"pitch":6,"lyric":"遂","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":82.8525,"duration":0.3669,"pitch":5,"lyric":"真","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":83.4,"duration":0.4366,"pitch":5,"lyric":"靡","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":83.9325,"duration":0.2296,"pitch":6,"lyric":"革","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":84.2125,"duration":0.1968,"pitch":6,"lyric":"匪","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":84.4525,"duration":0.4489,"pitch":6,"lyric":"因","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":85.1,"duration":0.4695,"pitch":5,"lyric":"靡","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":85.6725,"duration":0.1312,"pitch":6,"lyric":"故","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":85.83250000000001,"duration":0.4592,"pitch":6,"lyric":"匪","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":86.3925,"duration":0.5801,"pitch":5,"lyric":"新","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":87.3,"duration":0.8795,"pitch":5,"lyric":"何","lane":0,"chord":true,"chordLane":2,"vocal":true},{"time":88.3725,"duration":0.3608,"pitch":5,"lyric":"以","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":88.8125,"duration":0.41,"pitch":5,"lyric":"新","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":89.3125,"duration":0.3178,"pitch":6,"lyric":"之","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":89.9,"duration":0.207,"pitch":5,"lyric":"开","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":90.1525,"duration":0.1968,"pitch":6,"lyric":"物","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":90.3925,"duration":0.41,"pitch":6,"lyric":"前","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":90.8925,"duration":0.3341,"pitch":6,"lyric":"民","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":91.4,"duration":0.5514,"pitch":6,"lyric":"嗟","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":92.0725,"duration":0.3936,"pitch":6,"lyric":"尔","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":92.55250000000001,"duration":0.4264,"pitch":5,"lyric":"髦","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":93.0725,"duration":0.4325,"pitch":6,"lyric":"士","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":93.7,"duration":0.5351,"pitch":6,"lyric":"尚","lane":3,"chord":true,"chordLane":1,"vocal":true},{"time":94.3525,"duration":0.1968,"pitch":6,"lyric":"其","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":94.5925,"duration":0.8856,"pitch":6,"lyric":"有","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":95.6725,"duration":0.95,"pitch":6,"lyric":"闻","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":121.4,"duration":0.3218,"pitch":6,"lyric":"念","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":121.7925,"duration":0.41,"pitch":5,"lyric":"哉","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":122.2925,"duration":0.3936,"pitch":5,"lyric":"典","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":122.77250000000001,"duration":0.7605,"pitch":6,"lyric":"学","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":123.8,"duration":0.4367,"pitch":6,"lyric":"思","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":124.33250000000001,"duration":0.738,"pitch":6,"lyric":"睿","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":125.2325,"duration":0.41,"pitch":6,"lyric":"观","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":125.7325,"duration":0.4653,"pitch":5,"lyric":"通","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":126.7,"duration":0.4859,"pitch":5,"lyric":"有","lane":2,"chord":true,"chordLane":0,"vocal":true},{"time":127.2925,"duration":0.6232,"pitch":5,"lyric":"文","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":128.0525,"duration":0.41,"pitch":6,"lyric":"有","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":128.5525,"duration":0.613,"pitch":6,"lyric":"质","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":129.6,"duration":0.4039,"pitch":6,"lyric":"有","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":130.0925,"duration":0.738,"pitch":6,"lyric":"农","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":130.9925,"duration":0.4428,"pitch":6,"lyric":"有","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":131.5325,"duration":0.5473,"pitch":6,"lyric":"工","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":132.5,"duration":0.3382,"pitch":6,"lyric":"兼","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":132.9125,"duration":0.8036,"pitch":6,"lyric":"总","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":133.8925,"duration":0.4592,"pitch":5,"lyric":"条","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":134.45250000000001,"duration":0.6129,"pitch":6,"lyric":"贯","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":135.4,"duration":0.3874,"pitch":6,"lyric":"知","lane":0,"chord":true,"chordLane":2,"vocal":true},{"time":135.8725,"duration":0.7872,"pitch":5,"lyric":"至","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":136.8325,"duration":0.3936,"pitch":6,"lyric":"知","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":137.3125,"duration":0.6457,"pitch":7,"lyric":"终","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":138.3,"duration":0.3874,"pitch":6,"lyric":"成","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":138.7725,"duration":0.7708,"pitch":7,"lyric":"章","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":139.7125,"duration":0.3772,"pitch":7,"lyric":"乃","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":140.1725,"duration":0.6785,"pitch":6,"lyric":"达","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":141.1,"duration":0.4203,"pitch":6,"lyric":"若","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":141.6125,"duration":0.5904,"pitch":6,"lyric":"金","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":142.3325,"duration":0.2132,"pitch":6,"lyric":"之","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":142.5925,"duration":0.3608,"pitch":6,"lyric":"在","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":143.0325,"duration":0.6294,"pitch":6,"lyric":"镕","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":144.0,"duration":0.4202,"pitch":7,"lyric":"尚","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":144.5125,"duration":0.82,"pitch":6,"lyric":"亨","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":145.5125,"duration":0.328,"pitch":6,"lyric":"于","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":145.9125,"duration":0.7278,"pitch":6,"lyric":"野","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":147.0,"duration":0.3382,"pitch":6,"lyric":"无","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":147.4125,"duration":0.4264,"pitch":6,"lyric":"吝","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":147.93249999999998,"duration":0.7544,"pitch":6,"lyric":"于","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":148.8525,"duration":0.95,"pitch":6,"lyric":"宗","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":150.9,"duration":0.4202,"pitch":6,"lyric":"树","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":151.4125,"duration":0.328,"pitch":6,"lyric":"我","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":151.8125,"duration":0.4264,"pitch":6,"lyric":"邦","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":152.33249999999998,"duration":0.95,"pitch":6,"lyric":"国","lane":3,"chord":false,"chordLane":null,"vocal":true},{"time":153.7,"duration":0.371,"pitch":6,"lyric":"天","lane":1,"chord":true,"chordLane":3,"vocal":true},{"time":154.15249999999997,"duration":0.3936,"pitch":6,"lyric":"下","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":154.6325,"duration":0.4428,"pitch":6,"lyric":"来","lane":0,"chord":false,"chordLane":null,"vocal":true},{"time":155.17249999999999,"duration":0.95,"pitch":6,"lyric":"同","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":156.7,"duration":0.3874,"pitch":6,"lyric":"天","lane":0,"chord":true,"chordLane":2,"vocal":true},{"time":157.17249999999999,"duration":0.95,"pitch":6,"lyric":"下","lane":2,"chord":false,"chordLane":null,"vocal":true},{"time":158.8525,"duration":0.95,"pitch":6,"lyric":"来","lane":1,"chord":false,"chordLane":null,"vocal":true},{"time":161.17249999999999,"duration":0.95,"pitch":6,"lyric":"同","lane":3,"chord":false,"chordLane":null,"vocal":true}],"lyrics":[{"time":28.5,"char":"大","phrase":0},{"time":29.1725,"char":"不","phrase":0},{"time":29.612499999999997,"char":"自","phrase":0},{"time":30.1525,"char":"多","phrase":0},{"time":31.4,"char":"海","phrase":1},{"time":31.7925,"char":"纳","phrase":1},{"time":32.7725,"char":"江","phrase":1},{"time":33.3725,"char":"河","phrase":1},{"time":34.5,"char":"惟","phrase":2},{"time":35.0125,"char":"学","phrase":2},{"time":36.1325,"char":"无","phrase":2},{"time":36.5525,"char":"际","phrase":2},{"time":38.2,"char":"际","phrase":3},{"time":38.7925,"char":"于","phrase":3},{"time":39.3125,"char":"天","phrase":3},{"time":39.9325,"char":"地","phrase":3},{"time":41.0,"char":"形","phrase":4},{"time":41.4925,"char":"上","phrase":4},{"time":42.6325,"char":"谓","phrase":4},{"time":43.1525,"char":"道","phrase":4},{"time":44.2325,"char":"兮","phrase":4},{"time":44.8,"char":"形","phrase":5},{"time":45.3525,"char":"下","phrase":5},{"time":45.9125,"char":"谓","phrase":5},{"time":46.4725,"char":"器","phrase":5},{"time":48.1,"char":"礼","phrase":6},{"time":48.6325,"char":"主","phrase":6},{"time":49.1925,"char":"别","phrase":6},{"time":49.9525,"char":"异","phrase":6},{"time":50.792500000000004,"char":"兮","phrase":6},{"time":51.5,"char":"乐","phrase":7},{"time":51.9525,"char":"主","phrase":7},{"time":52.432500000000005,"char":"和","phrase":7},{"time":52.99250000000001,"char":"同","phrase":7},{"time":54.1,"char":"知","phrase":8},{"time":54.3325,"char":"其","phrase":8},{"time":54.63250000000001,"char":"不","phrase":8},{"time":55.3125,"char":"二","phrase":8},{"time":55.6525,"char":"兮","phrase":8},{"time":56.3,"char":"尔","phrase":9},{"time":56.852500000000006,"char":"听","phrase":9},{"time":57.4125,"char":"斯","phrase":9},{"time":58.0125,"char":"聪","phrase":9},{"time":61.2,"char":"国","phrase":10},{"time":61.8125,"char":"有","phrase":10},{"time":62.3925,"char":"成","phrase":10},{"time":62.8725,"char":"均","phrase":10},{"time":64.0,"char":"在","phrase":11},{"time":64.5725,"char":"浙","phrase":11},{"time":65.63250000000001,"char":"之","phrase":11},{"time":66.1725,"char":"滨","phrase":11},{"time":67.8,"char":"昔","phrase":12},{"time":68.3725,"char":"言","phrase":12},{"time":68.8525,"char":"求","phrase":12},{"time":69.41250000000001,"char":"是","phrase":12},{"time":70.8,"char":"实","phrase":13},{"time":70.9725,"char":"启","phrase":13},{"time":71.2325,"char":"尔","phrase":13},{"time":72.1125,"char":"求","phrase":13},{"time":72.6725,"char":"真","phrase":13},{"time":74.4,"char":"习","phrase":14},{"time":74.8725,"char":"坎","phrase":14},{"time":75.3925,"char":"示","phrase":14},{"time":75.91250000000001,"char":"教","phrase":14},{"time":77.0,"char":"始","phrase":15},{"time":77.5325,"char":"见","phrase":15},{"time":78.5725,"char":"经","phrase":15},{"time":79.1925,"char":"纶","phrase":15},{"time":80.3,"char":"无","phrase":16},{"time":80.77250000000001,"char":"曰","phrase":16},{"time":80.9925,"char":"已","phrase":16},{"time":81.3125,"char":"是","phrase":16},{"time":81.9,"char":"无","phrase":17},{"time":82.3725,"char":"曰","phrase":17},{"time":82.6125,"char":"遂","phrase":17},{"time":82.8525,"char":"真","phrase":17},{"time":83.4,"char":"靡","phrase":18},{"time":83.9325,"char":"革","phrase":18},{"time":84.2125,"char":"匪","phrase":18},{"time":84.4525,"char":"因","phrase":18},{"time":85.1,"char":"靡","phrase":19},{"time":85.6725,"char":"故","phrase":19},{"time":85.83250000000001,"char":"匪","phrase":19},{"time":86.3925,"char":"新","phrase":19},{"time":87.3,"char":"何","phrase":20},{"time":88.3725,"char":"以","phrase":20},{"time":88.8125,"char":"新","phrase":20},{"time":89.3125,"char":"之","phrase":20},{"time":89.9,"char":"开","phrase":21},{"time":90.1525,"char":"物","phrase":21},{"time":90.3925,"char":"前","phrase":21},{"time":90.8925,"char":"民","phrase":21},{"time":91.4,"char":"嗟","phrase":22},{"time":92.0725,"char":"尔","phrase":22},{"time":92.55250000000001,"char":"髦","phrase":22},{"time":93.0725,"char":"士","phrase":22},{"time":93.7,"char":"尚","phrase":23},{"time":94.3525,"char":"其","phrase":23},{"time":94.5925,"char":"有","phrase":23},{"time":95.6725,"char":"闻","phrase":23},{"time":121.4,"char":"念","phrase":24},{"time":121.7925,"char":"哉","phrase":24},{"time":122.2925,"char":"典","phrase":24},{"time":122.77250000000001,"char":"学","phrase":24},{"time":123.8,"char":"思","phrase":25},{"time":124.33250000000001,"char":"睿","phrase":25},{"time":125.2325,"char":"观","phrase":25},{"time":125.7325,"char":"通","phrase":25},{"time":126.7,"char":"有","phrase":26},{"time":127.2925,"char":"文","phrase":26},{"time":128.0525,"char":"有","phrase":26},{"time":128.5525,"char":"质","phrase":26},{"time":129.6,"char":"有","phrase":27},{"time":130.0925,"char":"农","phrase":27},{"time":130.9925,"char":"有","phrase":27},{"time":131.5325,"char":"工","phrase":27},{"time":132.5,"char":"兼","phrase":28},{"time":132.9125,"char":"总","phrase":28},{"time":133.8925,"char":"条","phrase":28},{"time":134.45250000000001,"char":"贯","phrase":28},{"time":135.4,"char":"知","phrase":29},{"time":135.8725,"char":"至","phrase":29},{"time":136.8325,"char":"知","phrase":29},{"time":137.3125,"char":"终","phrase":29},{"time":138.3,"char":"成","phrase":30},{"time":138.7725,"char":"章","phrase":30},{"time":139.7125,"char":"乃","phrase":30},{"time":140.1725,"char":"达","phrase":30},{"time":141.1,"char":"若","phrase":31},{"time":141.6125,"char":"金","phrase":31},{"time":142.3325,"char":"之","phrase":31},{"time":142.5925,"char":"在","phrase":31},{"time":143.0325,"char":"镕","phrase":31},{"time":144.0,"char":"尚","phrase":32},{"time":144.5125,"char":"亨","phrase":32},{"time":145.5125,"char":"于","phrase":32},{"time":145.9125,"char":"野","phrase":32},{"time":147.0,"char":"无","phrase":33},{"time":147.4125,"char":"吝","phrase":33},{"time":147.93249999999998,"char":"于","phrase":33},{"time":148.8525,"char":"宗","phrase":33},{"time":150.9,"char":"树","phrase":34},{"time":151.4125,"char":"我","phrase":34},{"time":151.8125,"char":"邦","phrase":34},{"time":152.33249999999998,"char":"国","phrase":34},{"time":153.7,"char":"天","phrase":35},{"time":154.15249999999997,"char":"下","phrase":35},{"time":154.6325,"char":"来","phrase":35},{"time":155.17249999999999,"char":"同","phrase":35},{"time":156.7,"char":"天","phrase":36},{"time":157.17249999999999,"char":"下","phrase":36},{"time":158.8525,"char":"来","phrase":36},{"time":161.17249999999999,"char":"同","phrase":36}]}
+diff --git a/app/src/game/anthem-phrases.json b/app/src/game/anthem-phrases.json
+new file mode 100644
+--- /dev/null
++++ b/app/src/game/anthem-phrases.json
+@@ -0,0 +1,1063 @@
++[
++  {
++    "phrase": 0,
++    "text": "大不自多",
++    "start": 28.5,
++    "end": 31.2,
++    "chars": [
++      {
++        "char": "大",
++        "start": 28.5,
++        "end": 29.1725
++      },
++      {
++        "char": "不",
++        "start": 29.1725,
++        "end": 29.612499999999997
++      },
++      {
++        "char": "自",
++        "start": 29.612499999999997,
++        "end": 30.1525
++      },
++      {
++        "char": "多",
++        "start": 30.1525,
++        "end": 31.2
++      }
++    ]
++  },
++  {
++    "phrase": 1,
++    "text": "海纳江河",
++    "start": 31.4,
++    "end": 34.1,
++    "chars": [
++      {
++        "char": "海",
++        "start": 31.4,
++        "end": 31.7925
++      },
++      {
++        "char": "纳",
++        "start": 31.7925,
++        "end": 32.7725
++      },
++      {
++        "char": "江",
++        "start": 32.7725,
++        "end": 33.3725
++      },
++      {
++        "char": "河",
++        "start": 33.3725,
++        "end": 34.1
++      }
++    ]
++  },
++  {
++    "phrase": 2,
++    "text": "惟学无际",
++    "start": 34.5,
++    "end": 37.8,
++    "chars": [
++      {
++        "char": "惟",
++        "start": 34.5,
++        "end": 35.0125
++      },
++      {
++        "char": "学",
++        "start": 35.0125,
++        "end": 36.1325
++      },
++      {
++        "char": "无",
++        "start": 36.1325,
++        "end": 36.5525
++      },
++      {
++        "char": "际",
++        "start": 36.5525,
++        "end": 37.8
++      }
++    ]
++  },
++  {
++    "phrase": 3,
++    "text": "际于天地",
++    "start": 38.2,
++    "end": 40.6,
++    "chars": [
++      {
++        "char": "际",
++        "start": 38.2,
++        "end": 38.7925
++      },
++      {
++        "char": "于",
++        "start": 38.7925,
++        "end": 39.3125
++      },
++      {
++        "char": "天",
++        "start": 39.3125,
++        "end": 39.9325
++      },
++      {
++        "char": "地",
++        "start": 39.9325,
++        "end": 40.6
++      }
++    ]
++  },
++  {
++    "phrase": 4,
++    "text": "形上谓道兮",
++    "start": 41.0,
++    "end": 44.7,
++    "chars": [
++      {
++        "char": "形",
++        "start": 41.0,
++        "end": 41.4925
++      },
++      {
++        "char": "上",
++        "start": 41.4925,
++        "end": 42.6325
++      },
++      {
++        "char": "谓",
++        "start": 42.6325,
++        "end": 43.1525
++      },
++      {
++        "char": "道",
++        "start": 43.1525,
++        "end": 44.2325
++      },
++      {
++        "char": "兮",
++        "start": 44.2325,
++        "end": 44.7
++      }
++    ]
++  },
++  {
++    "phrase": 5,
++    "text": "形下谓器",
++    "start": 44.8,
++    "end": 47.6,
++    "chars": [
++      {
++        "char": "形",
++        "start": 44.8,
++        "end": 45.3525
++      },
++      {
++        "char": "下",
++        "start": 45.3525,
++        "end": 45.9125
++      },
++      {
++        "char": "谓",
++        "start": 45.9125,
++        "end": 46.4725
++      },
++      {
++        "char": "器",
++        "start": 46.4725,
++        "end": 47.6
++      }
++    ]
++  },
++  {
++    "phrase": 6,
++    "text": "礼主别异兮",
++    "start": 48.1,
++    "end": 51.3,
++    "chars": [
++      {
++        "char": "礼",
++        "start": 48.1,
++        "end": 48.6325
++      },
++      {
++        "char": "主",
++        "start": 48.6325,
++        "end": 49.1925
++      },
++      {
++        "char": "别",
++        "start": 49.1925,
++        "end": 49.9525
++      },
++      {
++        "char": "异",
++        "start": 49.9525,
++        "end": 50.792500000000004
++      },
++      {
++        "char": "兮",
++        "start": 50.792500000000004,
++        "end": 51.3
++      }
++    ]
++  },
++  {
++    "phrase": 7,
++    "text": "乐主和同",
++    "start": 51.5,
++    "end": 53.9,
++    "chars": [
++      {
++        "char": "乐",
++        "start": 51.5,
++        "end": 51.9525
++      },
++      {
++        "char": "主",
++        "start": 51.9525,
++        "end": 52.432500000000005
++      },
++      {
++        "char": "和",
++        "start": 52.432500000000005,
++        "end": 52.99250000000001
++      },
++      {
++        "char": "同",
++        "start": 52.99250000000001,
++        "end": 53.9
++      }
++    ]
++  },
++  {
++    "phrase": 8,
++    "text": "知其不二兮",
++    "start": 54.1,
++    "end": 56.2,
++    "chars": [
++      {
++        "char": "知",
++        "start": 54.1,
++        "end": 54.3325
++      },
++      {
++        "char": "其",
++        "start": 54.3325,
++        "end": 54.63250000000001
++      },
++      {
++        "char": "不",
++        "start": 54.63250000000001,
++        "end": 55.3125
++      },
++      {
++        "char": "二",
++        "start": 55.3125,
++        "end": 55.6525
++      },
++      {
++        "char": "兮",
++        "start": 55.6525,
++        "end": 56.2
++      }
++    ]
++  },
++  {
++    "phrase": 9,
++    "text": "尔听斯聪",
++    "start": 56.3,
++    "end": 59.7,
++    "chars": [
++      {
++        "char": "尔",
++        "start": 56.3,
++        "end": 56.852500000000006
++      },
++      {
++        "char": "听",
++        "start": 56.852500000000006,
++        "end": 57.4125
++      },
++      {
++        "char": "斯",
++        "start": 57.4125,
++        "end": 58.0125
++      },
++      {
++        "char": "聪",
++        "start": 58.0125,
++        "end": 59.7
++      }
++    ]
++  },
++  {
++    "phrase": 10,
++    "text": "国有成均",
++    "start": 61.2,
++    "end": 63.9,
++    "chars": [
++      {
++        "char": "国",
++        "start": 61.2,
++        "end": 61.8125
++      },
++      {
++        "char": "有",
++        "start": 61.8125,
++        "end": 62.3925
++      },
++      {
++        "char": "成",
++        "start": 62.3925,
++        "end": 62.8725
++      },
++      {
++        "char": "均",
++        "start": 62.8725,
++        "end": 63.9
++      }
++    ]
++  },
++  {
++    "phrase": 11,
++    "text": "在浙之滨",
++    "start": 64.0,
++    "end": 67.3,
++    "chars": [
++      {
++        "char": "在",
++        "start": 64.0,
++        "end": 64.5725
++      },
++      {
++        "char": "浙",
++        "start": 64.5725,
++        "end": 65.63250000000001
++      },
++      {
++        "char": "之",
++        "start": 65.63250000000001,
++        "end": 66.1725
++      },
++      {
++        "char": "滨",
++        "start": 66.1725,
++        "end": 67.3
++      }
++    ]
++  },
++  {
++    "phrase": 12,
++    "text": "昔言求是",
++    "start": 67.8,
++    "end": 70.5,
++    "chars": [
++      {
++        "char": "昔",
++        "start": 67.8,
++        "end": 68.3725
++      },
++      {
++        "char": "言",
++        "start": 68.3725,
++        "end": 68.8525
++      },
++      {
++        "char": "求",
++        "start": 68.8525,
++        "end": 69.41250000000001
++      },
++      {
++        "char": "是",
++        "start": 69.41250000000001,
++        "end": 70.5
++      }
++    ]
++  },
++  {
++    "phrase": 13,
++    "text": "实启尔求真",
++    "start": 70.8,
++    "end": 73.8,
++    "chars": [
++      {
++        "char": "实",
++        "start": 70.8,
++        "end": 70.9725
++      },
++      {
++        "char": "启",
++        "start": 70.9725,
++        "end": 71.2325
++      },
++      {
++        "char": "尔",
++        "start": 71.2325,
++        "end": 72.1125
++      },
++      {
++        "char": "求",
++        "start": 72.1125,
++        "end": 72.6725
++      },
++      {
++        "char": "真",
++        "start": 72.6725,
++        "end": 73.8
++      }
++    ]
++  },
++  {
++    "phrase": 14,
++    "text": "习坎示教",
++    "start": 74.4,
++    "end": 76.9,
++    "chars": [
++      {
++        "char": "习",
++        "start": 74.4,
++        "end": 74.8725
++      },
++      {
++        "char": "坎",
++        "start": 74.8725,
++        "end": 75.3925
++      },
++      {
++        "char": "示",
++        "start": 75.3925,
++        "end": 75.91250000000001
++      },
++      {
++        "char": "教",
++        "start": 75.91250000000001,
++        "end": 76.9
++      }
++    ]
++  },
++  {
++    "phrase": 15,
++    "text": "始见经纶",
++    "start": 77.0,
++    "end": 80.1,
++    "chars": [
++      {
++        "char": "始",
++        "start": 77.0,
++        "end": 77.5325
++      },
++      {
++        "char": "见",
++        "start": 77.5325,
++        "end": 78.5725
++      },
++      {
++        "char": "经",
++        "start": 78.5725,
++        "end": 79.1925
++      },
++      {
++        "char": "纶",
++        "start": 79.1925,
++        "end": 80.1
++      }
++    ]
++  },
++  {
++    "phrase": 16,
++    "text": "无曰已是",
++    "start": 80.3,
++    "end": 81.7,
++    "chars": [
++      {
++        "char": "无",
++        "start": 80.3,
++        "end": 80.77250000000001
++      },
++      {
++        "char": "曰",
++        "start": 80.77250000000001,
++        "end": 80.9925
++      },
++      {
++        "char": "已",
++        "start": 80.9925,
++        "end": 81.3125
++      },
++      {
++        "char": "是",
++        "start": 81.3125,
++        "end": 81.7
++      }
++    ]
++  },
++  {
++    "phrase": 17,
++    "text": "无曰遂真",
++    "start": 81.9,
++    "end": 83.3,
++    "chars": [
++      {
++        "char": "无",
++        "start": 81.9,
++        "end": 82.3725
++      },
++      {
++        "char": "曰",
++        "start": 82.3725,
++        "end": 82.6125
++      },
++      {
++        "char": "遂",
++        "start": 82.6125,
++        "end": 82.8525
++      },
++      {
++        "char": "真",
++        "start": 82.8525,
++        "end": 83.3
++      }
++    ]
++  },
++  {
++    "phrase": 18,
++    "text": "靡革匪因",
++    "start": 83.4,
++    "end": 85.0,
++    "chars": [
++      {
++        "char": "靡",
++        "start": 83.4,
++        "end": 83.9325
++      },
++      {
++        "char": "革",
++        "start": 83.9325,
++        "end": 84.2125
++      },
++      {
++        "char": "匪",
++        "start": 84.2125,
++        "end": 84.4525
++      },
++      {
++        "char": "因",
++        "start": 84.4525,
++        "end": 85.0
++      }
++    ]
++  },
++  {
++    "phrase": 19,
++    "text": "靡故匪新",
++    "start": 85.1,
++    "end": 87.1,
++    "chars": [
++      {
++        "char": "靡",
++        "start": 85.1,
++        "end": 85.6725
++      },
++      {
++        "char": "故",
++        "start": 85.6725,
++        "end": 85.83250000000001
++      },
++      {
++        "char": "匪",
++        "start": 85.83250000000001,
++        "end": 86.3925
++      },
++      {
++        "char": "新",
++        "start": 86.3925,
++        "end": 87.1
++      }
++    ]
++  },
++  {
++    "phrase": 20,
++    "text": "何以新之",
++    "start": 87.3,
++    "end": 89.7,
++    "chars": [
++      {
++        "char": "何",
++        "start": 87.3,
++        "end": 88.3725
++      },
++      {
++        "char": "以",
++        "start": 88.3725,
++        "end": 88.8125
++      },
++      {
++        "char": "新",
++        "start": 88.8125,
++        "end": 89.3125
++      },
++      {
++        "char": "之",
++        "start": 89.3125,
++        "end": 89.7
++      }
++    ]
++  },
++  {
++    "phrase": 21,
++    "text": "开物前民",
++    "start": 89.9,
++    "end": 91.3,
++    "chars": [
++      {
++        "char": "开",
++        "start": 89.9,
++        "end": 90.1525
++      },
++      {
++        "char": "物",
++        "start": 90.1525,
++        "end": 90.3925
++      },
++      {
++        "char": "前",
++        "start": 90.3925,
++        "end": 90.8925
++      },
++      {
++        "char": "民",
++        "start": 90.8925,
++        "end": 91.3
++      }
++    ]
++  },
++  {
++    "phrase": 22,
++    "text": "嗟尔髦士",
++    "start": 91.4,
++    "end": 93.6,
++    "chars": [
++      {
++        "char": "嗟",
++        "start": 91.4,
++        "end": 92.0725
++      },
++      {
++        "char": "尔",
++        "start": 92.0725,
++        "end": 92.55250000000001
++      },
++      {
++        "char": "髦",
++        "start": 92.55250000000001,
++        "end": 93.0725
++      },
++      {
++        "char": "士",
++        "start": 93.0725,
++        "end": 93.6
++      }
++    ]
++  },
++  {
++    "phrase": 23,
++    "text": "尚其有闻",
++    "start": 93.7,
++    "end": 97.4,
++    "chars": [
++      {
++        "char": "尚",
++        "start": 93.7,
++        "end": 94.3525
++      },
++      {
++        "char": "其",
++        "start": 94.3525,
++        "end": 94.5925
++      },
++      {
++        "char": "有",
++        "start": 94.5925,
++        "end": 95.6725
++      },
++      {
++        "char": "闻",
++        "start": 95.6725,
++        "end": 97.4
++      }
++    ]
++  },
++  {
++    "phrase": 24,
++    "text": "念哉典学",
++    "start": 121.4,
++    "end": 123.7,
++    "chars": [
++      {
++        "char": "念",
++        "start": 121.4,
++        "end": 121.7925
++      },
++      {
++        "char": "哉",
++        "start": 121.7925,
++        "end": 122.2925
++      },
++      {
++        "char": "典",
++        "start": 122.2925,
++        "end": 122.77250000000001
++      },
++      {
++        "char": "学",
++        "start": 122.77250000000001,
++        "end": 123.7
++      }
++    ]
++  },
++  {
++    "phrase": 25,
++    "text": "思睿观通",
++    "start": 123.8,
++    "end": 126.3,
++    "chars": [
++      {
++        "char": "思",
++        "start": 123.8,
++        "end": 124.33250000000001
++      },
++      {
++        "char": "睿",
++        "start": 124.33250000000001,
++        "end": 125.2325
++      },
++      {
++        "char": "观",
++        "start": 125.2325,
++        "end": 125.7325
++      },
++      {
++        "char": "通",
++        "start": 125.7325,
++        "end": 126.3
++      }
++    ]
++  },
++  {
++    "phrase": 26,
++    "text": "有文有质",
++    "start": 126.7,
++    "end": 129.3,
++    "chars": [
++      {
++        "char": "有",
++        "start": 126.7,
++        "end": 127.2925
++      },
++      {
++        "char": "文",
++        "start": 127.2925,
++        "end": 128.0525
++      },
++      {
++        "char": "有",
++        "start": 128.0525,
++        "end": 128.5525
++      },
++      {
++        "char": "质",
++        "start": 128.5525,
++        "end": 129.3
++      }
++    ]
++  },
++  {
++    "phrase": 27,
++    "text": "有农有工",
++    "start": 129.6,
++    "end": 132.2,
++    "chars": [
++      {
++        "char": "有",
++        "start": 129.6,
++        "end": 130.0925
++      },
++      {
++        "char": "农",
++        "start": 130.0925,
++        "end": 130.9925
++      },
++      {
++        "char": "有",
++        "start": 130.9925,
++        "end": 131.5325
++      },
++      {
++        "char": "工",
++        "start": 131.5325,
++        "end": 132.2
++      }
++    ]
++  },
++  {
++    "phrase": 28,
++    "text": "兼总条贯",
++    "start": 132.5,
++    "end": 135.2,
++    "chars": [
++      {
++        "char": "兼",
++        "start": 132.5,
++        "end": 132.9125
++      },
++      {
++        "char": "总",
++        "start": 132.9125,
++        "end": 133.8925
++      },
++      {
++        "char": "条",
++        "start": 133.8925,
++        "end": 134.45250000000001
++      },
++      {
++        "char": "贯",
++        "start": 134.45250000000001,
++        "end": 135.2
++      }
++    ]
++  },
++  {
++    "phrase": 29,
++    "text": "知至知终",
++    "start": 135.4,
++    "end": 138.1,
++    "chars": [
++      {
++        "char": "知",
++        "start": 135.4,
++        "end": 135.8725
++      },
++      {
++        "char": "至",
++        "start": 135.8725,
++        "end": 136.8325
++      },
++      {
++        "char": "知",
++        "start": 136.8325,
++        "end": 137.3125
++      },
++      {
++        "char": "终",
++        "start": 137.3125,
++        "end": 138.1
++      }
++    ]
++  },
++  {
++    "phrase": 30,
++    "text": "成章乃达",
++    "start": 138.3,
++    "end": 141.0,
++    "chars": [
++      {
++        "char": "成",
++        "start": 138.3,
++        "end": 138.7725
++      },
++      {
++        "char": "章",
++        "start": 138.7725,
++        "end": 139.7125
++      },
++      {
++        "char": "乃",
++        "start": 139.7125,
++        "end": 140.1725
++      },
++      {
++        "char": "达",
++        "start": 140.1725,
++        "end": 141.0
++      }
++    ]
++  },
++  {
++    "phrase": 31,
++    "text": "若金之在镕",
++    "start": 141.1,
++    "end": 143.8,
++    "chars": [
++      {
++        "char": "若",
++        "start": 141.1,
++        "end": 141.6125
++      },
++      {
++        "char": "金",
++        "start": 141.6125,
++        "end": 142.3325
++      },
++      {
++        "char": "之",
++        "start": 142.3325,
++        "end": 142.5925
++      },
++      {
++        "char": "在",
++        "start": 142.5925,
++        "end": 143.0325
++      },
++      {
++        "char": "镕",
++        "start": 143.0325,
++        "end": 143.8
++      }
++    ]
++  },
++  {
++    "phrase": 32,
++    "text": "尚亨于野",
++    "start": 144.0,
++    "end": 146.8,
++    "chars": [
++      {
++        "char": "尚",
++        "start": 144.0,
++        "end": 144.5125
++      },
++      {
++        "char": "亨",
++        "start": 144.5125,
++        "end": 145.5125
++      },
++      {
++        "char": "于",
++        "start": 145.5125,
++        "end": 145.9125
++      },
++      {
++        "char": "野",
++        "start": 145.9125,
++        "end": 146.8
++      }
++    ]
++  },
++  {
++    "phrase": 33,
++    "text": "无吝于宗",
++    "start": 147.0,
++    "end": 150.6,
++    "chars": [
++      {
++        "char": "无",
++        "start": 147.0,
++        "end": 147.4125
++      },
++      {
++        "char": "吝",
++        "start": 147.4125,
++        "end": 147.93249999999998
++      },
++      {
++        "char": "于",
++        "start": 147.93249999999998,
++        "end": 148.8525
++      },
++      {
++        "char": "宗",
++        "start": 148.8525,
++        "end": 150.6
++      }
++    ]
++  },
++  {
++    "phrase": 34,
++    "text": "树我邦国",
++    "start": 150.9,
++    "end": 153.6,
++    "chars": [
++      {
++        "char": "树",
++        "start": 150.9,
++        "end": 151.4125
++      },
++      {
++        "char": "我",
++        "start": 151.4125,
++        "end": 151.8125
++      },
++      {
++        "char": "邦",
++        "start": 151.8125,
++        "end": 152.33249999999998
++      },
++      {
++        "char": "国",
++        "start": 152.33249999999998,
++        "end": 153.6
++      }
++    ]
++  },
++  {
++    "phrase": 35,
++    "text": "天下来同",
++    "start": 153.7,
++    "end": 156.6,
++    "chars": [
++      {
++        "char": "天",
++        "start": 153.7,
++        "end": 154.15249999999997
++      },
++      {
++        "char": "下",
++        "start": 154.15249999999997,
++        "end": 154.6325
++      },
++      {
++        "char": "来",
++        "start": 154.6325,
++        "end": 155.17249999999999
++      },
++      {
++        "char": "同",
++        "start": 155.17249999999999,
++        "end": 156.6
++      }
++    ]
++  },
++  {
++    "phrase": 36,
++    "text": "天下来同",
++    "start": 156.7,
++    "end": 166.5,
++    "chars": [
++      {
++        "char": "天",
++        "start": 156.7,
++        "end": 157.17249999999999
++      },
++      {
++        "char": "下",
++        "start": 157.17249999999999,
++        "end": 158.8525
++      },
++      {
++        "char": "来",
++        "start": 158.8525,
++        "end": 161.17249999999999
++      },
++      {
++        "char": "同",
++        "start": 161.17249999999999,
++        "end": 166.5
++      }
++    ]
++  }
++]
+\ No newline at end of file
+diff --git a/app/src/game/anthem-timing.ts b/app/src/game/anthem-timing.ts
+new file mode 100644
+--- /dev/null
++++ b/app/src/game/anthem-timing.ts
+@@ -0,0 +1,21 @@
++import chartData from './anthem-chart.json'
++
++// Seconds from the start of the decoded recording to the first sung character.
++// Demucs acoustic onset: 28.5125s, rounded to the requested 0.1s precision.
++export const introOffset = 28.5
++
++// Remove the chart's own anchor once. A retimed chart records its measured
++// vocalOrigin; the original chart falls back to its first timestamped lyric.
++export const chartVocalOrigin = (chartData as { vocalOrigin?: number }).vocalOrigin ?? chartData.lyrics[0].time
++
++export function vocalTime(contextTime: number, startAt: number, outputLatency: number): number {
++  return contextTime - startAt - outputLatency - introOffset
++}
++
++export function recordingTime(songTime: number): number {
++  return songTime + introOffset
++}
++
++export function activePhraseIndex(phrases: ReadonlyArray<{ start: number; end: number }>, fileTime: number): number {
++  return phrases.findIndex((phrase) => fileTime >= phrase.start && fileTime < phrase.end)
++}
+diff --git a/app/src/game/anthem.ts b/app/src/game/anthem.ts
+--- a/app/src/game/anthem.ts
++++ b/app/src/game/anthem.ts
+@@ -1,7 +1,9 @@
+ import { readPreferences } from './preferences'
+ import chartData from './anthem-chart.json'
++import phraseData from './anthem-phrases.json'
+ import { isBrief } from './edition'
+ import { assetUrl } from './asset'
++import { chartVocalOrigin, introOffset } from './anthem-timing'
+ 
+ export type AnthemNote = {
+   time: number
+@@ -11,6 +13,7 @@
+   lane?: number
+   chord?: boolean
+   chordLane?: number | null
++  vocal?: boolean
+ }
+ 
+ /** One sung character of the anthem, timed to its onset in the choir recording. */
+@@ -20,13 +23,27 @@
+   phrase: number
+ }
+ 
+-// 谱面来自对实际合唱录音的节拍、频谱起音与乐句分析，时间与音频共用同一时钟；
+-// 逐字歌词轨来自人声频段（250Hz–3.4kHz）的起音检测，每个字对准录音里真正唱出的时刻。
+-export function buildAnthem(): { notes: AnthemNote[]; duration: number; beat: number; lyrics: LyricChar[] } {
+-  const notes = isBrief ? chartData.notes.filter((note) => note.time < 52) : chartData.notes
+-  const lyrics = isBrief ? chartData.lyrics.filter((entry) => entry.time < 52) : chartData.lyrics
+-  const duration = isBrief ? 54 : chartData.duration
+-  return { notes, duration, beat: chartData.beat, lyrics }
++/** Forced alignment timestamps are absolute seconds within the audio file. */
++export type AnthemPhrase = {
++  start: number
++  end: number
++  text: string
++  chars?: Array<{ char: string; start: number; end: number }>
++}
++
++// Notes and aligned phrases store real recording-relative timestamps. Normalize
++// the note chart once at its vocal anchor; the shared AudioContext clock applies
++// the measured intro. Keep the negative prelude note playable.
++export function buildAnthem(): { notes: AnthemNote[]; duration: number; beat: number; lyrics: LyricChar[]; phrases: AnthemPhrase[] } {
++  const notes = (isBrief ? chartData.notes.filter((note) => note.time < 52) : chartData.notes)
++    .map((note) => ({ ...note, time: note.time - chartVocalOrigin }))
++  const phrases = isBrief ? phraseData.filter((phrase) => phrase.start < 52) : phraseData
++  const lyrics = phrases.flatMap((phrase, index) =>
++    (phrase.chars ?? Array.from(phrase.text, (char) => ({ char, start: phrase.start, end: phrase.end })))
++      .map((entry) => ({ char: entry.char, time: entry.start - introOffset, phrase: index })))
++  // The buffer is unchanged; finish at its real end rather than shifting its tail.
++  const duration = (isBrief ? 54 : chartData.duration) - introOffset
++  return { notes, duration, beat: chartData.beat, lyrics, phrases }
+ }
+ 
+ export class AnthemPlayer {
+diff --git a/app/src/game/boot.ts b/app/src/game/boot.ts
+--- a/app/src/game/boot.ts
++++ b/app/src/game/boot.ts
+@@ -18,7 +18,7 @@
+       obstacles?: Array<{ x: number; kind: string }>
+     }
+     __GAME_READY__?: boolean
+-    __rhythmProbe?: () => { now: number; startAt: number; duration: number; ready: boolean; sourceDuration: number; notes: number; score: number; combo: number; miss: number; songTime: number; lastRawErrorMs: number | null; inputOffset: number }
++    __rhythmProbe?: () => { now: number; startAt: number; duration: number; ready: boolean; sourceDuration: number; notes: number; score: number; combo: number; miss: number; songTime: number; lastRawErrorMs: number | null; inputOffset: number; introOffset: number; fileTime: number; firstNoteTime: number; firstSungNoteTime: number; noteTargets: Array<{time: number; fileTime: number; lane: number; lyric: string; vocal: boolean}>; firstLyricTime: number; countdown: string; activePhrase: number; lyricText: string; lyricVisible: boolean; phraseStart: number | null; phraseEnd: number | null }
+   }
+ }
+ 
+diff --git a/app/tests/anthem-timing.test.ts b/app/tests/anthem-timing.test.ts
+new file mode 100644
+--- /dev/null
++++ b/app/tests/anthem-timing.test.ts
+@@ -0,0 +1,89 @@
++import { describe, it } from 'node:test'
++import assert from 'node:assert/strict'
++import { buildAnthem } from '../src/game/anthem'
++import originalChart from '../src/game/anthem-chart.json'
++import phraseData from '../src/game/anthem-phrases.json'
++import confirmedPhrases from './fixtures/confirmed-lyrics.json'
++import { activePhraseIndex, chartVocalOrigin, introOffset, recordingTime, vocalTime } from '../src/game/anthem-timing'
++
++const close = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`)
++
++describe('recording and vocal timeline', () => {
++  it('places time zero at the audible first vocal, including output latency', () => {
++    close(vocalTime(10 + .075 + introOffset, 10, .075), 0)
++    close(recordingTime(vocalTime(10 + .075, 10, .075)), 0)
++  })
++  it('preserves the actual countdown and playable negative prelude times', () => {
++    close(recordingTime(vocalTime(7.5, 10, .075)), -2.575)
++    const introNote = buildAnthem().notes[0]
++    assert.ok(introNote.time < 0)
++    close(introNote.time, originalChart.notes[0].time - chartVocalOrigin)
++    assert.ok(recordingTime(introNote.time) > 0)
++    close(recordingTime(introNote.time), 9.021)
++  })
++  it('normalizes note and lyric anchors once, retaining relative spacing', () => {
++    const song = buildAnthem()
++    assert.ok(Math.abs(song.lyrics[0].time) <= .05)
++    close(song.notes[1].time, originalChart.notes[1].time - chartVocalOrigin)
++    for (let i = 0; i < song.notes.length; i++) {
++      close(song.notes[i].time, originalChart.notes[i].time - chartVocalOrigin)
++    }
++    const alignedChars = phraseData.flatMap((phrase) => phrase.chars)
++    for (let i = 0; i < song.lyrics.length; i++) close(song.lyrics[i].time, alignedChars[i].start - introOffset)
++    close(recordingTime(song.lyrics[0].time), phraseData[0].chars[0].start)
++  })
++  it('ends at the unchanged recording duration with all lyrics reachable', () => {
++    const song = buildAnthem()
++    close(recordingTime(song.duration), originalChart.duration)
++    assert.ok(song.lyrics.every((entry) => entry.time < song.duration))
++    assert.ok(song.notes.every((note) => note.time < song.duration))
++  })
++  it('advances the chart by elapsed audio time without accumulating frame drift', () => {
++    const before = vocalTime(30, 4, .04)
++    const after = vocalTime(30.7, 4, .04)
++    close(after - before, .7)
++    close(vocalTime(30.7, 4, .04), after) // a suspended context keeps all targets frozen
++  })
++  it('shows phrases only during their start-inclusive, end-exclusive intervals', () => {
++    const phrases = [{ start: 28.4, end: 31.7 }, { start: 40, end: 44.2 }]
++    assert.equal(activePhraseIndex(phrases, 28.399), -1)
++    assert.equal(activePhraseIndex(phrases, 28.4), 0)
++    assert.equal(activePhraseIndex(phrases, 31.699), 0)
++    assert.equal(activePhraseIndex(phrases, 31.7), -1)
++    assert.equal(activePhraseIndex(phrases, 39.999), -1)
++    assert.equal(activePhraseIndex(phrases, 40), 1)
++    assert.equal(activePhraseIndex(phrases, 44.2), -1)
++  })
++  it('keeps aligned phrase text, characters and intervals consistent', () => {
++    for (let i = 0; i < phraseData.length; i++) {
++      const phrase = phraseData[i]
++      assert.ok(phrase.start < phrase.end)
++      if (i) assert.ok(phrase.start >= phraseData[i - 1].end)
++      assert.equal(phrase.chars.map((entry) => entry.char).join(''), phrase.text)
++      for (const entry of phrase.chars) assert.ok(entry.start >= phrase.start && entry.start < entry.end && entry.end <= phrase.end)
++      assert.equal(activePhraseIndex(phraseData, phrase.start), i)
++      assert.notEqual(activePhraseIndex(phraseData, phrase.end), i)
++      close(phrase.start * 10, Math.round(phrase.start * 10))
++      close(phrase.end * 10, Math.round(phrase.end * 10))
++    }
++  })
++  it('includes every user-confirmed phrase and repeated final refrain', () => {
++    assert.deepEqual(phraseData.map((phrase) => phrase.text), confirmedPhrases)
++    assert.equal(phraseData.length, 37)
++    assert.equal(phraseData.flatMap((phrase) => phrase.chars).length, 153)
++    assert.deepEqual(phraseData.slice(-2).map((phrase) => phrase.text), ['天下来同', '天下来同'])
++  })
++  it('places each sung note at its actual aligned character attack', () => {
++    const song = buildAnthem()
++    const vocalNotes = song.notes.filter((note) => note.vocal)
++    const chars = phraseData.flatMap((phrase) => phrase.chars)
++    assert.equal(vocalNotes.length, chars.length)
++    assert.equal(song.notes.filter((note) => !note.vocal).length, 1)
++    close(chartVocalOrigin, introOffset)
++    for (let i = 0; i < chars.length; i++) {
++      close(recordingTime(vocalNotes[i].time), chars[i].start)
++      assert.equal(vocalNotes[i].lyric, chars[i].char)
++    }
++    assert.equal(vocalNotes.filter((note) => note.chord).length, phraseData.length)
++  })
++})
+diff --git a/app/tests/fixtures/confirmed-lyrics.json b/app/tests/fixtures/confirmed-lyrics.json
+new file mode 100644
+--- /dev/null
++++ b/app/tests/fixtures/confirmed-lyrics.json
+@@ -0,0 +1,39 @@
++[
++  "大不自多",
++  "海纳江河",
++  "惟学无际",
++  "际于天地",
++  "形上谓道兮",
++  "形下谓器",
++  "礼主别异兮",
++  "乐主和同",
++  "知其不二兮",
++  "尔听斯聪",
++  "国有成均",
++  "在浙之滨",
++  "昔言求是",
++  "实启尔求真",
++  "习坎示教",
++  "始见经纶",
++  "无曰已是",
++  "无曰遂真",
++  "靡革匪因",
++  "靡故匪新",
++  "何以新之",
++  "开物前民",
++  "嗟尔髦士",
++  "尚其有闻",
++  "念哉典学",
++  "思睿观通",
++  "有文有质",
++  "有农有工",
++  "兼总条贯",
++  "知至知终",
++  "成章乃达",
++  "若金之在镕",
++  "尚亨于野",
++  "无吝于宗",
++  "树我邦国",
++  "天下来同",
++  "天下来同"
++]

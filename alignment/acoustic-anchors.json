@@ -1,0 +1,11 @@
+{
+  "audio": "separated/htdemucs/extracted_zju-anthem-choir/vocals.wav",
+  "method": "Mono vocal stem; zero-phase fourth-order 180–3500Hz bandpass; 10ms RMS frames with50ms smoothing. Boundaries inspected independently of raw CTC output.",
+  "anchors": [
+    {"kind":"first_vocal_onset", "time":28.5, "window":[28.50,28.56], "confidence":"high", "evidence":"RMS at28.4≈0.00039,28.5≈0.01437,28.6≈0.04277. Sustained voice absent earlier except tiny intro leakage."},
+    {"kind":"phrase_23_release", "phrase":23, "text":"尚其有闻", "time":97.4, "window":[97.2,97.6], "confidence":"medium", "evidence":"Held闻 energy through97.3; smoother decay starts97.4. Reverb excluded, continues to99s."},
+    {"kind":"phrase_24_reentry", "phrase":24, "text":"念哉典学", "time":121.4, "window":[121.3,121.4], "confidence":"high", "evidence":"RMS near2e-5 through120.8;121.3≈0.00569;121.4≈0.06392. Reentry cannot be120.x."},
+    {"kind":"final_vocal_release", "phrase":36, "text":"天下来同", "time":166.5, "window":[166.4,166.6], "confidence":"high", "evidence":"Final同 energy stays0.1–0.3 through166.4, then declines from166.5. Reverb persists to169.5; direct vocal release is166.5."}
+  ],
+  "limits": "Amplitude alone cannot verify lexical boundaries in legato choir. Internal phrase starts need phonetic forced alignment; sung vowels can continue long after CTC token spikes. Export0.1-second resolution does not establish±0.1-second accuracy for every soft boundary."
+}

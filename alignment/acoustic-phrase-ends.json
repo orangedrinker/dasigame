@@ -1,0 +1,298 @@
+[
+  {
+    "phrase": 0,
+    "text": "大不自多",
+    "end": 31.2,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 1,
+    "text": "海纳江河",
+    "end": 34.1,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 2,
+    "text": "惟学无际",
+    "end": 37.8,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 3,
+    "text": "际于天地",
+    "end": 40.6,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 4,
+    "text": "形上谓道兮",
+    "end": 44.7,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 5,
+    "text": "形下谓器",
+    "end": 47.6,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 6,
+    "text": "礼主别异兮",
+    "end": 51.3,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 7,
+    "text": "乐主和同",
+    "end": 53.9,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 8,
+    "text": "知其不二兮",
+    "end": 56.2,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 9,
+    "text": "尔听斯聪",
+    "end": 59.7,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 10,
+    "text": "国有成均",
+    "end": 63.9,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 11,
+    "text": "在浙之滨",
+    "end": 67.3,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 12,
+    "text": "昔言求是",
+    "end": 70.5,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 13,
+    "text": "实启尔求真",
+    "end": 73.8,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 14,
+    "text": "习坎示教",
+    "end": 76.9,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 15,
+    "text": "始见经纶",
+    "end": 80.1,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 16,
+    "text": "无曰已是",
+    "end": 81.7,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 17,
+    "text": "无曰遂真",
+    "end": 83.3,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 18,
+    "text": "靡革匪因",
+    "end": 85.0,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 19,
+    "text": "靡故匪新",
+    "end": 87.1,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 20,
+    "text": "何以新之",
+    "end": 89.7,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 21,
+    "text": "开物前民",
+    "end": 91.3,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 22,
+    "text": "嗟尔髦士",
+    "end": 93.6,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 23,
+    "text": "尚其有闻",
+    "end": 97.4,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 24,
+    "text": "念哉典学",
+    "end": 123.7,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 25,
+    "text": "思睿观通",
+    "end": 126.3,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 26,
+    "text": "有文有质",
+    "end": 129.3,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 27,
+    "text": "有农有工",
+    "end": 132.2,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 28,
+    "text": "兼总条贯",
+    "end": 135.2,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 29,
+    "text": "知至知终",
+    "end": 138.1,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 30,
+    "text": "成章乃达",
+    "end": 141.0,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 31,
+    "text": "若金之在镕",
+    "end": 143.8,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 32,
+    "text": "尚亨于野",
+    "end": 146.8,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 33,
+    "text": "无吝于宗",
+    "end": 150.6,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 34,
+    "text": "树我邦国",
+    "end": 153.6,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "soft vowel/reverb boundary may vary~0.2s"
+  },
+  {
+    "phrase": 35,
+    "text": "天下来同",
+    "end": 156.6,
+    "confidence": "medium",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "legato into repeated phrase"
+  },
+  {
+    "phrase": 36,
+    "text": "天下来同",
+    "end": 166.5,
+    "confidence": "high",
+    "method": "isolated-vocal RMS release review; legato boundary capped before next phrase",
+    "note": "direct held-vowel release; long reverb excluded"
+  }
+]

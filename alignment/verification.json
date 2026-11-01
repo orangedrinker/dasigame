@@ -1,0 +1,27 @@
+{
+  "status": "passed",
+  "regressionTests": 21,
+  "browserCheckGroups": [
+    "single HTML boot and rhythm entry with network offline",
+    "images/audio embedded",
+    "all153 sung characters have notes at aligned physical onsets",
+    "full audio scheduling and vocal-relative clock",
+    "pause freezes shared AudioContext clock",
+    "resume advances chart and audio equally",
+    "native keyboard judgement matches first aligned vocal note",
+    "first-vocal boundary agrees with full-file playback",
+    "phrase visibility across full recording with injected clock",
+    "restart creates one anthem source and resets vocal clock",
+    "mobile orientation rebuild and timed lyric",
+    "exit closes anthem source",
+    "zero external requests and runtime/console errors"
+  ],
+  "phraseSamples": 222,
+  "phrases": 37,
+  "characters": 153,
+  "noteTargets": 191,
+  "embeddedAssets": 28,
+  "runtimeErrors": [],
+  "externalRequests": [],
+  "browserHarness": "Real AudioContext and native Playwright key for onset/pause/restart; injected file-time clock for full-song phrase-boundary cases; offline document fulfilled locally because managed Chromium blocks file://."
+}

@@ -1,33 +1,34 @@
 # 求是 · 文军长征
 
-## 直接下载运行
+仓库根目录的 **[final-game.html](final-game.html)** 是可独立运行的完整游戏，包含全部图片、音频、游戏逻辑及完整逐句歌词。下载原始文件后，用 Chrome 或 Edge 打开并点击开始即可；无需安装依赖或启动服务器。
 
-完整成品是仓库根目录的 **[final-game.html](final-game.html)**，约 **14.15 MB**。这个文件已经包含游戏代码、样式、全部图片和音频，可独立运行。
+## 校歌与歌词同步
 
-1. 打开 `final-game.html` 的 GitHub 文件页面，点击 **Download raw file / 下载原始文件**，保存为 `final-game.html`。
-2. 用 Chrome 或 Edge 打开文件，点击游戏中的开始按钮播放声音。
-3. 可以把这个 HTML 文件直接发送到钉钉；接收者下载后用浏览器打开。
+- 使用用户确认的完整37句、153字歌词，保留最后重复的“天下来同”。
+- Demucs分离人声，以中文CTC强制对齐并结合Whisper文本约束对齐、声学起音/尾音检查生成时间轴。
+- 测得首次起唱为 **28.5秒**，作为全局 `introOffset`。前奏、间奏、完整原曲与尾声全部保留。
+- 字幕、音符位置和判定共用 `AudioContext.currentTime`，计入播放起点和输出延迟；暂停和恢复共用同一时钟。
+- 按每句的开始、结束时间显示当前歌词，句间空白隐藏；最后一句持续到166.5秒的尾音释放。
+- 谱面按真实对齐字头重新生成，保留9.021秒的前奏音符。不会重复叠加前奏，也不会让末句超出约172.225秒的音频长度。
 
-不需要解压、安装 Node.js 或启动服务器。请下载文件后运行，而不是使用钉钉的文件预览。
+[lyrics-timeline.json](lyrics-timeline.json) 提供每句的起止时间和文本（单位：秒，保留0.1秒）；[lyrics-alignment-report.md](lyrics-alignment-report.md) 说明方法、声学复核及误差范围。时间戳分辨率不等于合唱所有软边界均保证±0.1秒。
 
-可重新构建的准版工程保存在 `qiushi-improved(3).zip`；`rhythm-sync-source.patch` 提供可读的 TypeScript 源码差异，便于审查。
+## 验证
 
-## 本次修改
+TypeScript检查、21项回归测试与生产构建通过。离线浏览器验证涵盖实际音频启动/起唱、暂停恢复、重开与退出、37句字幕的开始/结束边界、移动端显示；全部28项嵌入素材逐项SHA-256一致。
 
-- 格式化主 JS，以 AudioContext.currentTime 统一歌曲时间、音符位置和判定，并加入输出延迟及 inputOffset 补偿。
-- 统一点击与自动 MISS 的判定时间，保留曲末音符窗口。
-- 添加可点击穿透的实时调试面板，显示歌曲时间、原始按键误差和输入偏移。
-- 字幕在歌曲第 28.4 秒从第一句开始变化，此前保留默认字幕；后续歌词保持原相对间隔。
-- 修复异步加载与退出、重开的竞态，清理旧音轨和键盘监听；修复按钮焦点及判定线旋转错位。
+## 重新构建
 
-## 验证记录
+`qiushi-improved(3).zip` 保存本次完整源码及构建结果。解压后在 `app/` 中运行：
 
-- JavaScript 语法、TypeScript 检查和生产构建通过。
-- 42 项时钟、补偿、调试及生命周期专项检查通过；12 项现有测试通过。
-- 浏览器压力验证通过：900ms 加载延迟、200ms/700ms 主线程阻塞、加载中退出及重开。恢复更新后音符位置误差均为 0px，未出现重复校歌音源或运行时错误。
+```sh
+npm ci
+npm run check
+npm test
+npm run build
+node scripts/build-single.mjs dist final-game.html
+```
 
-解压后可在 `app/` 中运行 `npm ci`、`npm run check`、`npm test` 和 `npm run build`。源码已经同步，重新构建会保留功能修复。
+源码内 `src/game/anthem-phrases.json` 保存逐句与字符时间轴，`src/game/anthem-timing.ts` 定义 `introOffset` 和时间换算。`scripts/rebuild-aligned-chart.py` 可由已核验的字符对齐数据重新生成谱面。`lyric-sync-source.patch` 是本次相对于更新前源码包的差异；旧的 `rhythm-sync-source.patch` 留作历史参考。
 
-主线程完全阻塞期间，按键事件仍可能延迟送达；严格只使用处理时的 currentTime，无法还原该输入的真实发生时刻。
-
-当前字幕起点调整会将整条歌词后移约 14.956 秒，末字到达约 181.687 秒，超出约 172.225 秒曲长；本次未压缩后续歌词节奏或延长音乐。
+主线程阻塞仍会延迟画面刷新和按键事件送达；恢复后位置按音频时钟更新，模型估计的合唱软边界也可能需要进一步听校。
