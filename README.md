@@ -1,6 +1,16 @@
 # 求是 · 文军长征
 
-准版项目保存在 `qiushi-improved(3).zip`。本次提交更新其中的主 JS 及三个对应的 TypeScript 源文件；`rhythm-sync-source.patch` 提供可读的源码差异，便于审查。
+## 直接下载运行
+
+完整成品是仓库根目录的 **[final-game.html](final-game.html)**，约 **14.15 MB**。这个文件已经包含游戏代码、样式、全部图片和音频，可独立运行。
+
+1. 打开 `final-game.html` 的 GitHub 文件页面，点击 **Download raw file / 下载原始文件**，保存为 `final-game.html`。
+2. 用 Chrome 或 Edge 打开文件，点击游戏中的开始按钮播放声音。
+3. 可以把这个 HTML 文件直接发送到钉钉；接收者下载后用浏览器打开。
+
+不需要解压、安装 Node.js 或启动服务器。请下载文件后运行，而不是使用钉钉的文件预览。
+
+可重新构建的准版工程保存在 `qiushi-improved(3).zip`；`rhythm-sync-source.patch` 提供可读的 TypeScript 源码差异，便于审查。
 
 ## 本次修改
 
